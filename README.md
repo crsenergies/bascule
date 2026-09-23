@@ -14,8 +14,11 @@ Needs Node.js 20 or newer.
 npm install -g bascule   # or clone the repo and run: node server.mjs
 bascule init             # creates ~/.bascule/config.json and ~/.bascule/.env
 # put your API keys in ~/.bascule/.env (empty = provider disabled)
+bascule doctor           # checks every key and model; --deep sends one tiny request per model
 bascule                  # http://127.0.0.1:20129/v1
 ```
+
+While it runs, `bascule status` shows live counters: requests, fallbacks, tokens, and the state of every target (ready, cooling, learned rate limit).
 
 Point any OpenAI client at it:
 
@@ -55,9 +58,11 @@ Lookup order, first found wins:
 
 `config.json` lists `providers` (`type`: `openai` or `anthropic`, `baseUrl`, `keys`, `models`, optional `headers`, `rpm`, and `streamUsage: false` for APIs that reject `stream_options`) and `combos`. Top-level tuning: `timeoutMs`, `firstByteTimeoutMs`, `idleTimeoutMs`, `maxWaitMs`, `cache`, `corsOrigins`, `log`. `${VAR}` is replaced by the environment variable. Any OpenAI-compatible service works: add it with its base URL.
 
+Edits to the config or the `.env` file are applied live, without restart (also on `SIGHUP`). An edit that does not parse is rejected and the previous config keeps running. Only the address and port need a restart.
+
 Environment variables: `BASCULE_KEY`, `BASCULE_PORT`, `BASCULE_HOST`, `BASCULE_CONFIG`, `BASCULE_HOME`, `BASCULE_LOG=0` (silences the one-line-per-request log).
 
-Model IDs change often. The bundled list was checked on 2026-09-23; `GET /stats` shows which targets fail, so a retired model is easy to spot and remove.
+Model IDs change often. The bundled list was checked on 2026-09-23. `bascule doctor` flags any model the provider no longer lists, and `--deep` shows the ones that list but do not answer.
 
 ## Security
 
@@ -73,7 +78,7 @@ bascule routes between accounts and keys you are entitled to use. Respect each p
 ## Tests
 
 ```bash
-node test.mjs   # 70 end-to-end tests against mock providers, no network, no keys
+node test.mjs   # 73 end-to-end tests against mock providers, no network, no keys
 ```
 
 They cover fallback for every error class, key rotation, timeouts, streaming failures, the Anthropic translation, the security guards, 300 concurrent requests, memory growth over 3,000 requests, and the command line.
@@ -86,7 +91,8 @@ Une seule adresse locale, compatible OpenAI, devant tous tes fournisseurs d'IA. 
 
 1. Installer Node.js 20+, puis `npm install -g bascule`.
 2. `bascule init`, puis mettre tes clés API dans `~/.bascule/.env`.
-3. `bascule`, puis régler tes outils sur `http://127.0.0.1:20129/v1` avec le modèle `auto`.
+3. `bascule doctor` pour vérifier que tes clés marchent.
+4. `bascule`, puis régler tes outils sur `http://127.0.0.1:20129/v1` avec le modèle `auto`. `bascule status` montre ce qui se passe.
 
 Utilise seulement des comptes et des clés auxquels tu as droit : pas de comptes gratuits multiples, pas d'abonnement grand public utilisé comme clé API.
 

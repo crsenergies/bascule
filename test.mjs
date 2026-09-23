@@ -36,6 +36,7 @@ const sse = (res) => { res.writeHead(200, { 'content-type': 'text/event-stream' 
 
 // ---------- mock providers ----------
 const echo = await mock('echo', (req, res, body) => {
+  if (req.method === 'GET' && req.url.endsWith('/models')) return json(res, { object: 'list', data: [{ id: 'models/m' }, { id: 'only-here' }] });
   if (req.url.endsWith('/embeddings')) return json(res, { object: 'list', data: [{ embedding: [0.1, 0.2] }], model: body.model });
   if (!body.stream) return json(res, completion(`echo:${body.messages.at(-1).content}`, body.model));
   const w = sse(res);
@@ -491,6 +492,55 @@ try {
       assert.equal(r.status, 200, 'exported BASCULE_PORT must be used');
       assert.equal(seen.echo.auth, 'Bearer quoted # kept|plain');
     } finally { s3.kill(); }
+  });
+  await test('status prints live stats of the running router', async () => {
+    const r = run(['status']);
+    assert.equal(r.status, 0, r.stderr);
+    assert.match(r.stdout, /requests \d+/);
+    assert.match(r.stdout, /echo\/m#0 +ok +\d+/);
+  });
+  await test('doctor reports keys, listed and missing models, dead combos', async () => {
+    const home = mkdtempSync(join(tmpdir(), 'bascule-doc-'));
+    writeFileSync(join(home, 'config.json'), JSON.stringify({ providers: {
+      good: { baseUrl: echo, keys: ['k'], models: ['m', 'retired'] },
+      bad: { baseUrl: badKey400, keys: ['bad'], models: ['m'] },
+      down: { baseUrl: 'http://127.0.0.1:1', keys: ['k'], models: ['m'] },
+      nokey: { baseUrl: echo, keys: ['${NOPE_UNSET}'], models: ['m'] } },
+      combos: { ok: ['good/m'], dead: ['nokey/m'] } }));
+    // Async spawn: spawnSync would block this process, and with it the mock providers doctor calls.
+    const r = await new Promise((ok) => {
+      const c = spawn(process.execPath, [SERVER, 'doctor', '--deep'], { cwd: dir, env: { ...env, BASCULE_CONFIG: join(home, 'config.json') } });
+      let stdout = '', stderr = '';
+      c.stdout.on('data', (d) => (stdout += d)); c.stderr.on('data', (d) => (stderr += d));
+      c.on('exit', (status) => ok({ status, stdout, stderr }));
+    });
+    assert.equal(r.status, 0, r.stderr);
+    assert.match(r.stdout, /✓ +good key 1 \(…k\)/);
+    assert.match(r.stdout, /m: listed, answers/);
+    assert.match(r.stdout, /retired: NOT LISTED/);
+    assert.match(r.stdout, /✗ +bad key 1 .*invalid key/);
+    assert.match(r.stdout, /✗ +down key 1 .*unreachable/);
+    assert.match(r.stdout, /nokey: no key set/);
+    assert.match(r.stdout, /combo dead: 0\/1 .*unusable/);
+  });
+  await test('config edits are reloaded live; a broken edit keeps the old config', async () => {
+    const home = mkdtempSync(join(tmpdir(), 'bascule-reload-'));
+    const cfgPath = join(home, 'config.json'), p4 = port + 3;
+    const write = (combos) => writeFileSync(cfgPath, JSON.stringify({ port: p4, providers: { e: { baseUrl: echo, keys: ['k'], models: ['m'] } }, combos }));
+    write({ one: ['e/m'] });
+    const s4 = spawn(process.execPath, [SERVER], { cwd: home, env: { ...env, BASCULE_CONFIG: cfgPath }, stdio: ['ignore', 'pipe', 'pipe'] });
+    await new Promise((ok) => s4.stdout.once('data', ok));
+    const call = (model) => fetch(`http://127.0.0.1:${p4}/v1/chat/completions`, { method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model, messages: msg() }) }).then((r) => r.status);
+    try {
+      assert.equal(await call('two'), 404);
+      await sleep(1100); write({ one: ['e/m'], two: ['e/m'] });
+      for (let i = 0; i < 40 && (await call('two')) !== 200; i++) await sleep(100);
+      assert.equal(await call('two'), 200, 'new combo live without restart');
+      await sleep(1100); writeFileSync(cfgPath, '{ broken json');
+      await sleep(1800);
+      assert.equal(await call('two'), 200, 'broken edit must not take the router down');
+    } finally { s4.kill(); }
   });
   await test('SIGTERM stops the server within 5 s', async () => {
     const p2 = port + 1;

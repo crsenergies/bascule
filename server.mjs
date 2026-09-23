@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // Bascule — lean OpenAI-compatible AI router. Zero dependencies, Node >= 20.
 import http from 'node:http';
-import { readFileSync, existsSync, mkdirSync, copyFileSync, writeFileSync } from 'node:fs';
+import { readFileSync, existsSync, mkdirSync, copyFileSync, writeFileSync, watchFile } from 'node:fs';
 import { createHash, timingSafeEqual, randomBytes } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
@@ -19,6 +19,10 @@ if (arg === '--help' || arg === '-h') {
 
   bascule init      create ~/.bascule/config.json and ~/.bascule/.env (random access key)
   bascule           start the router (default http://127.0.0.1:20129/v1)
+  bascule doctor    check every configured key and model (add --deep to send a tiny real request)
+  bascule status    show live stats of the running router
+
+Config and keys are reloaded automatically when their files change (or on SIGHUP).
 
 Environment: BASCULE_KEY, BASCULE_PORT, BASCULE_HOST, BASCULE_CONFIG, BASCULE_HOME, BASCULE_LOG=0`);
   process.exit(0);
@@ -35,14 +39,18 @@ if (arg === 'init') {
   console.log(`config: ${cfgOut}\nkeys:   ${envOut}  (add your provider API keys, then run: bascule)`);
   process.exit(0);
 }
-if (arg) { console.error(`unknown argument "${arg}" (try --help)`); process.exit(2); }
+if (arg && !['doctor', 'status'].includes(arg)) { console.error(`unknown argument "${arg}" (try --help)`); process.exit(2); }
 
 // ---------- config ----------
+// Variables already set in the real environment win over the file. Those that came from the
+// file are remembered, so a reload can update them.
+const fromFile = new Set();
 function loadEnvFile(path) {
   if (!path || !existsSync(path)) return;
   for (const line of readFileSync(path, 'utf8').split(/\r?\n/)) {
     const m = line.match(/^\s*(?:export\s+)?([A-Za-z0-9_]+)\s*=\s*(.*?)\s*$/);
-    if (!m || process.env[m[1]] !== undefined) continue;
+    if (!m || (process.env[m[1]] !== undefined && !fromFile.has(m[1]))) continue;
+    fromFile.add(m[1]);
     let v = m[2];
     if (/^(["']).*\1$/.test(v)) v = v.slice(1, -1);
     else v = v.replace(/\s+#.*$/, ''); // inline comment on an unquoted value
@@ -55,7 +63,8 @@ function loadEnvFile(path) {
 const firstExisting = (...paths) => paths.find((p) => p && existsSync(p));
 const LOCAL_CFG = join(process.cwd(), 'bascule.json');
 const localSetup = existsSync(LOCAL_CFG);
-loadEnvFile(localSetup ? join(process.cwd(), '.env') : firstExisting(join(HOME_DIR, '.env'), join(ROOT, '.env')));
+const ENV_PATH = localSetup ? join(process.cwd(), '.env') : firstExisting(join(HOME_DIR, '.env'), join(ROOT, '.env'));
+loadEnvFile(ENV_PATH);
 
 const expand = (v) =>
   typeof v === 'string' ? v.replace(/\$\{(\w+)\}/g, (_, k) => process.env[k] ?? '')
@@ -65,22 +74,32 @@ const expand = (v) =>
 
 const CONFIG_PATH = firstExisting(process.env.BASCULE_CONFIG, localSetup && LOCAL_CFG,
   join(HOME_DIR, 'config.json'), join(ROOT, 'config.json'));
+const readConfig = () => {
+  const c = expand(JSON.parse(readFileSync(CONFIG_PATH, 'utf8')));
+  if (!c || typeof c !== 'object' || Array.isArray(c)) throw new Error('config must be a JSON object');
+  return c;
+};
 let cfg;
-try { cfg = expand(JSON.parse(readFileSync(CONFIG_PATH, 'utf8'))); }
+try { cfg = readConfig(); }
 catch (e) { console.error(`cannot read config ${CONFIG_PATH}: ${e.message}`); process.exit(1); }
 
+// Address is fixed for the process lifetime; everything below can change on reload.
 const PORT = Number(process.env.BASCULE_PORT || cfg.port || 20129);
 const HOST = process.env.BASCULE_HOST || cfg.host || '127.0.0.1';
-const API_KEY = process.env.BASCULE_KEY || cfg.apiKey || '';
-const CORS = [].concat(cfg.corsOrigins ?? []); // browser origins allowed to call; none by default
-const TIMEOUT = cfg.timeoutMs ?? 120_000;            // whole non-streaming call
-const FIRST_BYTE_TIMEOUT = cfg.firstByteTimeoutMs ?? 30_000;
-const IDLE_TIMEOUT = cfg.idleTimeoutMs ?? 60_000;    // max silence inside a stream
-const CACHE_MAX = cfg.cache?.maxEntries ?? 500;
-const CACHE_TTL = cfg.cache?.ttlMs ?? 10 * 60_000;
-const COMPACT = cfg.compactWhitespace ?? true;
-const LOG = process.env.BASCULE_LOG !== '0' && cfg.log !== false;
-const MAX_WAIT = cfg.maxWaitMs ?? 20_000;           // how long a request may wait for a rate limit to clear
+let API_KEY, CORS, TIMEOUT, FIRST_BYTE_TIMEOUT, IDLE_TIMEOUT, CACHE_MAX, CACHE_TTL, COMPACT, LOG, MAX_WAIT;
+function applySettings() {
+  API_KEY = process.env.BASCULE_KEY || cfg.apiKey || '';
+  CORS = [].concat(cfg.corsOrigins ?? []);       // browser origins allowed to call; none by default
+  TIMEOUT = cfg.timeoutMs ?? 120_000;            // whole non-streaming call
+  FIRST_BYTE_TIMEOUT = cfg.firstByteTimeoutMs ?? 30_000;
+  IDLE_TIMEOUT = cfg.idleTimeoutMs ?? 60_000;    // max silence inside a stream
+  CACHE_MAX = cfg.cache?.maxEntries ?? 500;
+  CACHE_TTL = cfg.cache?.ttlMs ?? 10 * 60_000;
+  COMPACT = cfg.compactWhitespace ?? true;
+  LOG = process.env.BASCULE_LOG !== '0' && cfg.log !== false;
+  MAX_WAIT = cfg.maxWaitMs ?? 20_000;           // how long a request may wait for a rate limit to clear
+}
+applySettings();
 
 // Exposing the router beyond this machine without a strong key would let anyone spend the owner's quotas.
 const LOOPBACK = ['127.0.0.1', '::1', 'localhost'].includes(HOST);
@@ -91,14 +110,34 @@ if (!LOOPBACK && (API_KEY.length < 16 || API_KEY === 'change-me')) {
 
 // ---------- providers & targets ----------
 // Provider: { type: 'openai'|'anthropic', baseUrl, keys: [..], headers, models: [..], streamUsage }
-const providers = {};
-for (const [name, p] of Object.entries(cfg.providers || {})) {
+function buildProviders(c) {
+  const out = {};
+  for (const [name, p] of Object.entries(c.providers || {})) {
   const keys = [].concat(p.keys ?? p.key ?? []).filter(Boolean);
-  if (p.requiresKey !== false && keys.length === 0) continue; // skip unconfigured providers
-  if (!p.baseUrl) { console.error(`provider "${name}" has no baseUrl, ignored`); continue; }
-  providers[name] = { name, type: p.type || 'openai', baseUrl: p.baseUrl.replace(/\/+$/, ''),
-    keys: keys.length ? keys : [''], headers: p.headers || {}, models: p.models || [],
-    streamUsage: p.streamUsage !== false, rpm: Number(p.rpm) || 0, rr: 0 };
+    if (p.requiresKey !== false && keys.length === 0) continue; // skip unconfigured providers
+    if (!p.baseUrl) { console.error(`provider "${name}" has no baseUrl, ignored`); continue; }
+    out[name] = { name, type: p.type || 'openai', baseUrl: p.baseUrl.replace(/\/+$/, ''),
+      keys: keys.length ? keys : [''], headers: p.headers || {}, models: p.models || [],
+      streamUsage: p.streamUsage !== false, rpm: Number(p.rpm) || 0, rr: 0 };
+  }
+  return out;
+}
+let providers = buildProviders(cfg);
+
+// Swap in a new config only if it parses and builds; a typo while editing keeps the old one running.
+function reload(reason) {
+  try {
+    loadEnvFile(ENV_PATH);
+    const next = readConfig();
+    const nextProviders = buildProviders(next);
+    const key = process.env.BASCULE_KEY || next.apiKey || '';
+    if (!LOOPBACK && (key.length < 16 || key === 'change-me')) throw new Error('BASCULE_KEY too weak for a non-local address');
+    cfg = next; providers = nextProviders;
+    applySettings();
+    console.log(`reloaded (${reason})  providers: ${Object.keys(providers).join(', ') || '(none)'}`);
+  } catch (e) {
+    console.error(`reload failed, keeping previous config: ${e.message}`);
+  }
 }
 
 // Health per "provider/model#keyIndex": cooldown + EWMA latency + failure streak.
@@ -653,7 +692,82 @@ function readBody(req, limit = 32 * 1024 * 1024) {
   });
 }
 
+// ---------- doctor & status ----------
+const mask = (k) => (k ? `…${k.slice(-4)}` : 'no key');
+async function doctor(deep) {
+  let working = 0;
+  for (const name of Object.keys(cfg.providers || {})) {
+    const p = providers[name];
+    if (!p) { console.log(`  -  ${name}: no key set, skipped`); continue; }
+    for (const [i, key] of p.keys.entries()) {
+      const url = p.type === 'anthropic' ? `${p.baseUrl}/v1/models` : `${p.baseUrl}/models`;
+      const headers = p.type === 'anthropic' ? { 'x-api-key': key, 'anthropic-version': '2023-06-01', ...p.headers }
+        : { ...(key ? { authorization: `Bearer ${key}` } : {}), ...p.headers };
+      let r, listed = null;
+      try {
+        r = await fetch(url, { headers, signal: AbortSignal.timeout(10_000) });
+        if (r.ok) listed = new Set(((await r.json()).data || []).map((m) => String(m.id).replace(/^models\//, '')));
+      } catch (e) {
+        console.log(`  ✗  ${name} key ${i + 1} (${mask(key)}): unreachable (${e.cause?.code || e.message})`);
+        continue;
+      }
+      if (!r.ok) {
+        const why = r.status === 401 || r.status === 403 || (r.status === 400 && BAD_KEY.test(await r.text().catch(() => ''))) ? 'invalid key' : `HTTP ${r.status}`;
+        console.log(`  ✗  ${name} key ${i + 1} (${mask(key)}): ${why}`);
+        continue;
+      }
+      working++;
+      console.log(`  ✓  ${name} key ${i + 1} (${mask(key)}): reachable, ${listed.size} models available`);
+      for (const m of p.models) {
+        let line = listed.has(m) ? 'listed' : 'NOT LISTED (retired or misspelled?)';
+        if (deep) {
+          try {
+            const up = await callOnce({ provider: p, model: m, id: `${name}/${m}` }, { key }, { messages: [{ role: 'user', content: 'ping' }], max_tokens: 16 },
+              new AbortController().signal, '/chat/completions');
+            await readJson(up.reader); up.cleanup();
+            line += ', answers';
+          } catch (e) {
+            line += `, FAILS: ${e.status || ''} ${String(e.message).replace(/\s+/g, ' ').slice(0, 90)}`;
+          }
+        }
+        console.log(`       ${m}: ${line}`);
+      }
+    }
+  }
+  for (const [name, combo] of Object.entries(cfg.combos || {})) {
+    const targets = Array.isArray(combo) ? combo : combo.targets || [];
+    const active = targets.filter((t) => parseTarget(t));
+    console.log(`  combo ${name}: ${active.length}/${targets.length} targets active${active.length ? '' : '  <- unusable, add a key'}`);
+  }
+  if (!deep) console.log('\n  (listing only: run "bascule doctor --deep" to send one tiny request per model)');
+  return working;
+}
+
+async function printStatus() {
+  const url = `http://${HOST.includes(':') ? `[${HOST}]` : HOST}:${PORT}/stats`;
+  let st;
+  try {
+    const r = await fetch(url, { headers: API_KEY ? { authorization: `Bearer ${API_KEY}` } : {}, signal: AbortSignal.timeout(5000) });
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    st = await r.json();
+  } catch (e) { console.error(`no router answering on ${url} (${e.cause?.code || e.message}). Start it with: bascule`); return false; }
+  console.log(`bascule ${st.version}, up ${st.uptimeS}s, providers: ${st.providers.join(', ')}`);
+  console.log(`requests ${st.requests}  cache hits ${st.cacheHits}  fallbacks ${st.fallbacks}  failures ${st.failures}  tokens ${st.tokens.prompt} in / ${st.tokens.completion} out`);
+  const rows = Object.entries(st.targets).sort(([a], [b]) => a.localeCompare(b));
+  if (rows.length) {
+    const w = Math.max(...rows.map(([id]) => id.length));
+    for (const [id, t] of rows) {
+      const state = t.coolingForS ? `cooling ${t.coolingForS}s` : 'ready';
+      console.log(`  ${id.padEnd(w)}  ok ${String(t.ok).padStart(5)}  err ${String(t.err).padStart(4)}  ${String(t.latencyMs).padStart(6)} ms  ${state}${t.learnedRpm ? `  limit ${t.learnedRpm}/min` : ''}`);
+    }
+  }
+  return true;
+}
+
 const ENDPOINTS = { '/v1/chat/completions': '/chat/completions', '/v1/embeddings': '/embeddings' };
+
+if (arg === 'doctor') process.exit((await doctor(process.argv.includes('--deep'))) ? 0 : 1);
+if (arg === 'status') process.exit((await printStatus()) ? 0 : 1);
 
 const server = http.createServer(async (req, res) => {
   const path = req.url.split('?')[0].replace(/\/+$/, '') || '/';
@@ -721,3 +835,13 @@ function shutdown() {
   setTimeout(() => { server.closeAllConnections(); process.exit(0); }, 5000).unref();
 }
 for (const sig of ['SIGINT', 'SIGTERM']) process.on(sig, shutdown);
+process.on('SIGHUP', () => reload('SIGHUP'));
+// Editors save in bursts (truncate, write, rename): wait for the file to settle before reloading.
+let reloadTimer;
+for (const f of [CONFIG_PATH, ENV_PATH].filter(Boolean)) {
+  watchFile(f, { interval: 1000 }, (cur, prev) => {
+    if (cur.mtimeMs === prev.mtimeMs) return;
+    clearTimeout(reloadTimer);
+    reloadTimer = setTimeout(() => reload(`${f} changed`), 300);
+  }).unref?.();
+}
