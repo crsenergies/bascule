@@ -88,7 +88,7 @@ catch (e) { console.error(`cannot read config ${CONFIG_PATH}: ${e.message}`); pr
 // Address is fixed for the process lifetime; everything below can change on reload.
 const PORT = Number(process.env.BASCULE_PORT || cfg.port || 20129);
 const HOST = process.env.BASCULE_HOST || cfg.host || '127.0.0.1';
-let API_KEY, CORS, TIMEOUT, FIRST_BYTE_TIMEOUT, IDLE_TIMEOUT, CACHE_MAX, CACHE_TTL, COMPACT, LOG, MAX_WAIT;
+let API_KEY, CORS, TIMEOUT, FIRST_BYTE_TIMEOUT, IDLE_TIMEOUT, CACHE_MAX, CACHE_TTL, LOG, MAX_WAIT;
 function applySettings() {
   API_KEY = process.env.BASCULE_KEY || cfg.apiKey || '';
   CORS = [].concat(cfg.corsOrigins ?? []);       // browser origins allowed to call; none by default
@@ -97,7 +97,6 @@ function applySettings() {
   IDLE_TIMEOUT = cfg.idleTimeoutMs ?? 60_000;    // max silence inside a stream
   CACHE_MAX = cfg.cache?.maxEntries ?? 500;
   CACHE_TTL = cfg.cache?.ttlMs ?? 10 * 60_000;
-  COMPACT = cfg.compactWhitespace ?? true;
   LOG = process.env.BASCULE_LOG !== '0' && cfg.log !== false;
   MAX_WAIT = cfg.maxWaitMs ?? 20_000;           // how long a request may wait for a rate limit to clear
 }
@@ -204,16 +203,6 @@ function keysFor(t, endpoint) {
 }
 
 // ---------- request shaping ----------
-function compact(body) {
-  if (!COMPACT || !Array.isArray(body.messages)) return body;
-  const squeeze = (s) => s.replace(/[ \t]+\n/g, '\n').replace(/\n{3,}/g, '\n\n').replace(/[ \t]{2,}/g, ' ');
-  for (const m of body.messages) {
-    if (!m || typeof m !== 'object') continue;
-    if (typeof m.content === 'string') m.content = squeeze(m.content);
-    else if (Array.isArray(m.content)) for (const c of m.content) if (c?.type === 'text' && typeof c.text === 'string') c.text = squeeze(c.text);
-  }
-  return body;
-}
 
 // OpenAI -> Anthropic request
 function toAnthropic(body, model) {
@@ -306,8 +295,8 @@ async function* anthropicStream(reader, model, onUsage) {
   const toolIdx = new Map(); // anthropic block index -> openai tool index
   let inTok = 0, started = false;
   for await (const ev of sseEvents(reader)) {
-    let d;
-    try { d = JSON.parse(ev); } catch { continue; }
+    const d = parseJson(ev);
+    if (!d) continue;
     if (d.type === 'error') throw new Upstream(502, d.error?.message || 'upstream stream error');
     // Nothing is sent before the upstream proves healthy, so an early error can still fall back.
     if (!started) { started = true; yield chunk({ role: 'assistant', content: '' }); }
@@ -332,22 +321,30 @@ async function* anthropicStream(reader, model, onUsage) {
   yield 'data: [DONE]\n\n';
 }
 
-// Yields the data payload of each SSE event.
-async function* sseEvents(reader) {
-  const dec = new TextDecoder();
+// Splits an SSE text stream into the data payloads of its complete events. Line endings are
+// normalised on the joined buffer: a CRLF can straddle two chunks, so a trailing lone CR waits.
+function sseSplitter() {
   let buf = '';
-  for (;;) {
-    const { value, done } = await reader.read();
-    if (done) break;
-    // Normalise line endings on the joined buffer, not per chunk: a CRLF can straddle two chunks.
-    // A trailing lone CR is kept until the next chunk shows whether an LF follows it.
-    buf = (buf + dec.decode(value, { stream: true })).replace(/\r\n|\r(?!$)/g, '\n');
+  return (text) => {
+    buf = (buf + text).replace(/\r\n|\r(?!$)/g, '\n');
+    const out = [];
     let i;
     while ((i = buf.indexOf('\n\n')) >= 0) {
-      const block = buf.slice(0, i); buf = buf.slice(i + 2);
-      const data = block.split('\n').filter((l) => l.startsWith('data:')).map((l) => l.slice(5).trimStart()).join('\n');
-      if (data) yield data;
+      const data = buf.slice(0, i).split('\n').filter((l) => l.startsWith('data:')).map((l) => l.slice(5).trimStart()).join('\n');
+      buf = buf.slice(i + 2);
+      if (data && data !== '[DONE]') out.push(data);
     }
+    return out;
+  };
+}
+const parseJson = (s) => { try { return JSON.parse(s); } catch { return null; } };
+
+async function* sseEvents(reader) {
+  const dec = new TextDecoder(), split = sseSplitter();
+  for (;;) {
+    const { value, done } = await reader.read();
+    if (done) return;
+    yield* split(dec.decode(value, { stream: true }));
   }
 }
 
@@ -355,52 +352,36 @@ async function* sseEvents(reader) {
 // until a meaningful event arrives (text, tool call or finish). Providers may answer 200 and then
 // put the error in the stream, after a content-free first chunk (Groq does this for tool calls
 // it rejects): such an error must still fall back to the next target.
-const inBandError = (d) => d?.error && new Upstream(Number(d.error.code) || (d.error.code === 'tool_use_failed' ? 400 : 502),
-  d.error.message || JSON.stringify(d.error));
+// In-stream error codes are numbers or names (Gemini: "RESOURCE_EXHAUSTED"); map names to HTTP statuses.
+const CODE_NAMES = { RESOURCE_EXHAUSTED: 429, rate_limit_exceeded: 429, UNAVAILABLE: 503, overloaded_error: 503, tool_use_failed: 400,
+  INVALID_ARGUMENT: 400, UNAUTHENTICATED: 401, PERMISSION_DENIED: 403, NOT_FOUND: 404 };
+const inBandError = (d) => {
+  const e = d.error, n = Number(e.code);
+  const status = Number.isInteger(n) && n >= 400 ? n : CODE_NAMES[e.code] || CODE_NAMES[e.status] || CODE_NAMES[e.type] || 502;
+  return new Upstream(status, e.message || JSON.stringify(e), retryFromBody(JSON.stringify(d)));
+};
 async function* passthrough(reader, onUsage) {
-  const dec = new TextDecoder();
-  let head = '', committed = false, tail = '';
+  const dec = new TextDecoder(), split = sseSplitter();
+  let held = '', committed = false, usage = null;
   for (;;) {
     const { value, done } = await reader.read();
     if (done) break;
     const s = dec.decode(value, { stream: true });
-    tail = (tail + s).slice(-16_384);
-    if (committed) {
-      // A late in-band error cannot fall back any more, but must still be counted as a failure.
-      if (s.includes('"error"')) for (const d of dataEvents(s)) if (d?.error && !d.choices) throw inBandError(d);
-      yield s;
-      continue;
-    }
-    head += s;
-    const complete = head.replace(/\r\n/g, '\n');
-    const cut = complete.lastIndexOf('\n\n');
-    if (cut < 0) continue;
-    for (const d of dataEvents(complete.slice(0, cut + 2))) {
-      if (d?.error && !d.choices) throw inBandError(d);
+    for (const data of split(s)) {
+      // Bytes are forwarded as received; once committed, only events that can matter are parsed.
+      if (committed && !data.includes('"usage"') && !data.includes('"error"')) continue;
+      const d = parseJson(data);
+      if (d?.error && !d.choices) throw inBandError(d); // after commit: counted as a mid-stream failure
+      if (d?.usage) usage = d.usage;
       const c = d?.choices?.[0];
       if (c && (c.delta?.content || c.delta?.tool_calls)) committed = true;
     }
-    if (committed) { yield head; head = ''; }
+    if (committed) { yield held + s; held = ''; } else held += s;
   }
   // Ended without a single word or tool call: an empty answer (free routers produce these),
   // so the next target gets a chance instead of the client receiving nothing.
-  if (!committed) throw new Upstream(502, head.trim() ? 'empty answer' : 'empty stream');
-  // Usage sits in the last chunk(s); parse whole events so nested objects are handled.
-  for (const ev of tail.replace(/\r\n/g, '\n').split('\n\n').reverse()) {
-    const line = ev.split('\n').find((l) => l.startsWith('data:'));
-    if (!line) continue;
-    try { const j = JSON.parse(line.slice(5)); if (j.usage) { onUsage(j.usage); break; } } catch {}
-  }
-}
-// JSON payloads of the complete data events in an SSE text ([DONE] and comments skipped).
-function dataEvents(txt) {
-  const out = [];
-  for (const block of txt.replace(/\r\n/g, '\n').split('\n\n')) {
-    const data = block.split('\n').filter((l) => l.startsWith('data:')).map((l) => l.slice(5).trimStart()).join('\n');
-    if (!data || data === '[DONE]') continue;
-    try { out.push(JSON.parse(data)); } catch {}
-  }
-  return out;
+  if (!committed) throw new Upstream(502, held.trim() ? 'empty answer' : 'empty stream');
+  if (usage) onUsage(usage);
 }
 
 // ---------- inbound Anthropic Messages API ----------
@@ -477,7 +458,8 @@ function toAnthropicMessage(o, model) {
 // OpenAI SSE (as produced by pipeStream's generators) -> Anthropic SSE events.
 async function* toAnthropicStream(gen, model) {
   const ev = (type, d) => `event: ${type}\ndata: ${JSON.stringify({ type, ...d })}\n\n`;
-  let buf = '', started = false, block = -1, open = null, finish = null, usage = null;
+  const split = sseSplitter();
+  let started = false, block = -1, open = null, finish = null, usage = null;
   const tools = new Map(); // openai tool index -> anthropic block index
   const close = () => (open ? (open = null, ev('content_block_stop', { index: block })) : '');
   for await (const raw of gen) {
@@ -486,14 +468,10 @@ async function* toAnthropicStream(gen, model) {
       yield ev('message_start', { message: { id: 'msg_' + randomBytes(12).toString('hex'), type: 'message', role: 'assistant', model,
         content: [], stop_reason: null, stop_sequence: null, usage: { input_tokens: 0, output_tokens: 0 } } });
     }
-    buf = (buf + raw).replace(/\r\n/g, '\n');
-    let i, out = '';
-    while ((i = buf.indexOf('\n\n')) >= 0) {
-      const line = buf.slice(0, i).split('\n').find((l) => l.startsWith('data:'));
-      buf = buf.slice(i + 2);
-      if (!line) continue;
-      let d;
-      try { d = JSON.parse(line.slice(5)); } catch { continue; } // [DONE] and keep-alives
+    let out = '';
+    for (const data of split(raw)) {
+      const d = parseJson(data);
+      if (!d) continue;
       if (d.usage) usage = d.usage;
       const c = d.choices?.[0];
       if (!c) continue;
@@ -530,6 +508,10 @@ function aliasFor(model) {
 }
 
 // ---------- upstream call ----------
+// Auth and version headers for a provider call.
+const authHeaders = (p, key) => (p.type === 'anthropic' ? { 'x-api-key': key, 'anthropic-version': '2023-06-01', ...p.headers }
+  : { ...(key ? { authorization: `Bearer ${key}` } : {}), ...p.headers });
+
 function buildRequest(t, key, body, endpoint) {
   const p = t.provider;
   // Reasoning models spend part of max_tokens thinking before they write; a small client budget
@@ -540,7 +522,7 @@ function buildRequest(t, key, body, endpoint) {
   }
   if (p.type === 'anthropic') {
     return { url: `${p.baseUrl}/v1/messages`, payload: toAnthropic(body, t.model),
-      headers: { 'x-api-key': key, 'anthropic-version': '2023-06-01', ...p.headers } };
+      headers: authHeaders(p, key) };
   }
   // Provider defaults (e.g. reasoning_effort) never override what the client asked for.
   const payload = { ...(endpoint === '/chat/completions' ? p.params : {}), ...body, model: t.model };
@@ -550,8 +532,7 @@ function buildRequest(t, key, body, endpoint) {
     payload.messages = body.messages.map((m) => (Array.isArray(m?.content) && m.content.every((c) => c?.type === 'text')
       ? { ...m, content: m.content.map((c) => c.text ?? '').join('\n') } : m));
   if (payload.stream && p.streamUsage) payload.stream_options = { include_usage: true, ...payload.stream_options };
-  return { url: `${p.baseUrl}${endpoint}`, payload,
-    headers: { ...(key ? { authorization: `Bearer ${key}` } : {}), ...p.headers } };
+  return { url: `${p.baseUrl}${endpoint}`, payload, headers: authHeaders(p, key) };
 }
 
 class Upstream extends Error {
@@ -568,7 +549,10 @@ function retryAfterS(v) {
 }
 
 // Gemini puts the delay in the body ("retryDelay": "11s"); OpenAI-style APIs in the message ("try again in 1.2s").
+// OpenRouter's daily free quota gives the reset instant ("X-RateLimit-Reset": epoch ms).
 function retryFromBody(txt) {
+  const reset = txt.match(/"X-RateLimit-Reset"\s*:\s*"?(\d{13})/i);
+  if (reset) return Math.max(0, (Number(reset[1]) - Date.now()) / 1000);
   const m = txt.match(/"retryDelay"\s*:\s*"([\d.]+)s"/) || txt.match(/(?:retry|try again) in ([\d.]+)\s*(ms|s)\b/i);
   if (!m) return 0;
   const n = parseFloat(m[1]);
@@ -621,9 +605,7 @@ function warmUp() {
   for (const p of Object.values(providers)) {
     const u = new URL(p.type === 'anthropic' ? `${p.baseUrl}/v1/models` : `${p.baseUrl}/models`);
     const lib = u.protocol === 'https:' ? https : http;
-    const headers = p.type === 'anthropic' ? { 'x-api-key': p.keys[0], 'anthropic-version': '2023-06-01' }
-      : p.keys[0] ? { authorization: `Bearer ${p.keys[0]}` } : {};
-    lib.get(u, { agent: agents[u.protocol], headers: { ...headers, ...p.headers }, timeout: 10_000 }, (res) => res.resume())
+    lib.get(u, { agent: agents[u.protocol], headers: authHeaders(p, p.keys[0]), timeout: 10_000 }, (res) => res.resume())
       .on('timeout', function () { this.destroy(); }).on('error', () => {});
   }
 }
@@ -1053,8 +1035,7 @@ async function doctor(deep) {
     if (!p) { console.log(`  -  ${name}: no key set, skipped`); continue; }
     for (const [i, key] of p.keys.entries()) {
       const url = p.type === 'anthropic' ? `${p.baseUrl}/v1/models` : `${p.baseUrl}/models`;
-      const headers = p.type === 'anthropic' ? { 'x-api-key': key, 'anthropic-version': '2023-06-01', ...p.headers }
-        : { ...(key ? { authorization: `Bearer ${key}` } : {}), ...p.headers };
+      const headers = authHeaders(p, key);
       let r, listed = null;
       try {
         r = await fetch(url, { headers, signal: AbortSignal.timeout(10_000) });
@@ -1166,13 +1147,12 @@ const server = http.createServer(async (req, res) => {
       }
       if (endpoint === 'anthropic') {
         if (!Array.isArray(body.messages) || !body.messages.length) return send(res, 400, err('messages must be a non-empty array', 'invalid_request'));
-        const oai = compact(fromAnthropicRequest(body));
+        const oai = fromAnthropicRequest(body);
         return await route(res, oai, { endpoint: '/chat/completions', requested,
           cacheable: !oai.stream && (oai.temperature === 0 || cfg.cache?.always === true) });
       }
       if (endpoint === '/chat/completions') {
         if (!Array.isArray(body.messages) || !body.messages.length) return send(res, 400, err('messages must be a non-empty array', 'invalid_request'));
-        compact(body);
         return await route(res, body, { endpoint, requested,
           cacheable: !body.stream && (body.temperature === 0 || cfg.cache?.always === true) });
       }

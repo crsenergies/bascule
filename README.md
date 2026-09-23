@@ -48,7 +48,7 @@ client.chat.completions.create(model="auto", messages=[{"role": "user", "content
 - Text-only content arrays are sent as plain strings, for APIs such as Groq that accept nothing else.
 - Combo strategies: `priority` (default), `fastest` (measured latency), `round-robin`.
 - OpenAI ⇄ Anthropic translation: system prompt, images, tools, tool results, streaming.
-- Response cache for `temperature: 0` requests (LRU, 10 min by default), whitespace compaction of prompts.
+- Response cache for `temperature: 0` requests (LRU, 10 min by default).
 - Client disconnect cancels the upstream request, so you are not billed for answers nobody reads.
 
 ## Configuration

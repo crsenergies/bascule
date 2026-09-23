@@ -79,6 +79,7 @@ const blank = await mock('blank', (req, res, body) => {
   if (!body.stream) return json(res, completion(''));
   const w = sse(res); w({ choices: [{ index: 0, delta: { role: 'assistant', content: '' } }] }); w({ choices: [{ index: 0, delta: {}, finish_reason: 'stop' }] }); res.end('data: [DONE]\n\n');
 });
+const namedErr = await mock('namedErr', (req, res) => { const w = sse(res); w({ error: { code: 'RESOURCE_EXHAUSTED', message: 'quota', details: [{ retryDelay: '40s' }] } }); res.end(); });
 const streamEmpty = await mock('streamEmpty', (req, res) => { res.writeHead(200, { 'content-type': 'text/event-stream' }); res.end(); });
 const streamCut = await mock('streamCut', (req, res) => { const w = sse(res); w({ choices: [{ index: 0, delta: { content: 'par' } }] }); setTimeout(() => res.destroy(), 50); });
 const streamStall = await mock('streamStall', (req, res) => { const w = sse(res); w({ choices: [{ index: 0, delta: { content: 'a' } }] }); });
@@ -97,6 +98,8 @@ const quota = await mock('quota', (req, res) => (++quotaCalls === 1
   ? json(res, [{ error: { code: 429, details: [{ '@type': 'type.googleapis.com/google.rpc.QuotaFailure', violations: [{ quotaMetric: 'generativelanguage.googleapis.com/generate_content_free_tier_requests', quotaId: 'GenerateRequestsPerMinutePerProjectPerModel-FreeTier', quotaDimensions: { location: 'global', model: 'm' }, quotaValue: '1' }] },
       { '@type': 'type.googleapis.com/google.rpc.RetryInfo', retryDelay: '0.1s' }] } }], 429)
   : json(res, completion('quota ok'))));
+const daily = await mock('daily', (req, res) => json(res, { error: { message: 'Rate limit exceeded: free-models-per-day', code: 429,
+  metadata: { headers: { 'X-RateLimit-Limit': '50', 'X-RateLimit-Remaining': '0', 'X-RateLimit-Reset': String(Date.now() + 3 * 3600_000) } } } }, 429));
 const budget = await mock('budget', (req, res) => json(res, completion('budget')));
 // Groq-like: string content only, no images. Ollama-like: no tools.
 const textOnly = await mock('textOnly', (req, res, body) => (body.messages.some((m) => typeof m.content !== 'string')
@@ -156,19 +159,19 @@ writeFileSync(join(dir, 'config.json'), JSON.stringify({
   providers: {
     echo: P(echo, { models: ['m', 'only-here'] }), limited: P(limited, { keys: ['k1', 'k2'] }), limitedDate: P(limitedDate),
     badKey: P(badKey, { keys: ['bad', 'good'] }), badKey400: P(badKey400, { keys: ['bad', 'good'] }), broken: P(broken, { keys: ['k1', 'k2', 'k3'] }), badReq: P(badReq), tooLong: P(tooLong),
-    tooBig: P(tooBig), streamErr: P(streamErr), streamEmpty: P(streamEmpty), blank: P(blank), lateErr: P(lateErr), toolFail: P(toolFail), streamCut: P(streamCut), streamStall: P(streamStall),
-    silent: P(silent), flaky429: P(flaky429), shared: P(shared), budget: P(budget, { rpm: 2 }), quota: P(quota), slowBody: P(slowBody), garbage: P(garbage), hang: P(hang), fast: P(fast), slow: P(slow), tortoise: P(tortoise), fresh: P(fast), tuned: P(fast, { minMaxTokens: 1024, params: { reasoning_effort: 'low' } }), textOnly: P(textOnly), noTools: P(noTools),
+    tooBig: P(tooBig), streamErr: P(streamErr), streamEmpty: P(streamEmpty), namedErr: P(namedErr), blank: P(blank), lateErr: P(lateErr), toolFail: P(toolFail), streamCut: P(streamCut), streamStall: P(streamStall),
+    silent: P(silent), flaky429: P(flaky429), shared: P(shared), budget: P(budget, { rpm: 2 }), daily: P(daily), quota: P(quota), slowBody: P(slowBody), garbage: P(garbage), hang: P(hang), fast: P(fast), slow: P(slow), tortoise: P(tortoise), fresh: P(fast), tuned: P(fast, { minMaxTokens: 1024, params: { reasoning_effort: 'low' } }), textOnly: P(textOnly), noTools: P(noTools),
     an: P(anthropic, { type: 'anthropic', keys: ['ak'], models: ['claude'] }), anCrlf: P(anthropicCrlf, { type: 'anthropic' }), anErr: P(anthropicErr, { type: 'anthropic' }),
     off: { baseUrl: 'http://127.0.0.1:1', keys: ['${UNSET_VAR}'], models: ['x'] },
   },
   combos: {
     auto: ['limited/m', 'echo/m'], smart: ['echo/m'], quick: ['fast/m'], dated: ['limitedDate/m', 'echo/m'], keys: ['badKey/m'], keys400: ['badKey400/m'], dead: ['broken/m', 'echo/m'],
     badreq: ['badReq/m', 'echo/m'], toolong: ['tooLong/m', 'echo/m'], toobig: ['tooBig/m', 'echo/m'],
-    serr: ['streamErr/m', 'echo/m'], sempty: ['streamEmpty/m', 'echo/m'], blank: ['blank/m', 'echo/m'], late: ['lateErr/m', 'echo/m'], toolfail: ['toolFail/m', 'echo/m'], scut: ['streamCut/m', 'echo/m'], sstall: ['streamStall/m'],
+    serr: ['streamErr/m', 'echo/m'], sempty: ['streamEmpty/m', 'echo/m'], named: ['namedErr/m', 'echo/m'], blank: ['blank/m', 'echo/m'], late: ['lateErr/m', 'echo/m'], toolfail: ['toolFail/m', 'echo/m'], scut: ['streamCut/m', 'echo/m'], sstall: ['streamStall/m'],
     silent: ['silent/m', 'echo/m'], slowbody: ['slowBody/m', 'echo/m'], garbage: ['garbage/m', 'echo/m'], hang: ['hang/m'],
     claude: ['an/claude'], crlf: ['anCrlf/m'], anerr: ['anErr/m', 'echo/m'], allfail: ['broken/m'], all429: ['limited/m'], emb: ['an/claude', 'echo/m'],
     flaky: ['flaky429/m'], hedge: { targets: ['tortoise/m', 'fast/m'], hedgeMs: 60 }, nohedge: ['tortoise/m', 'fast/m'],
-    hedgeFail: { targets: ['broken/m', 'tortoise/m'], hedgeMs: 60 }, hedgeStream: { targets: ['tortoise/m', 'echo/m'], hedgeMs: 60 }, vision: ['textOnly/m', 'echo/m'], visionNone: ['textOnly/m'], toolsc: ['noTools/m', 'echo/m'], budgeted: ['budget/m', 'echo/m'], learn: ['quota/m', 'echo/m'], rr: { strategy: 'round-robin', targets: ['fast/m', 'slow/m'] }, fastest: { strategy: 'fastest', targets: ['slow/m', 'fast/m'] },
+    hedgeFail: { targets: ['broken/m', 'tortoise/m'], hedgeMs: 60 }, hedgeStream: { targets: ['tortoise/m', 'echo/m'], hedgeMs: 60 }, vision: ['textOnly/m', 'echo/m'], visionNone: ['textOnly/m'], toolsc: ['noTools/m', 'echo/m'], budgeted: ['budget/m', 'echo/m'], daily: ['daily/m', 'echo/m'], learn: ['quota/m', 'echo/m'], rr: { strategy: 'round-robin', targets: ['fast/m', 'slow/m'] }, fastest: { strategy: 'fastest', targets: ['slow/m', 'fast/m'] },
     explore: { strategy: 'fastest', targets: ['slow/m', 'fast/m', 'fresh/m'] },
   },
 }));
@@ -234,7 +237,7 @@ try {
     const j = await r.json();
     assert.equal(r.status, 200);
     assert.equal(r.headers.get('x-bascule-target'), 'echo/m');
-    assert.equal(j.choices[0].message.content, 'echo:salut\n\ntoi', 'whitespace compacted');
+    assert.equal(j.choices[0].message.content, 'echo:salut   \n\n\n\ntoi', 'prompt text reaches the provider unchanged');
     assert.equal(hits.limited, 2);
   });
   await test('cooling target is skipped next time', async () => {
@@ -301,6 +304,12 @@ try {
     for (let i = 0; i < 3; i++) got.push((await post({ model: 'budgeted', messages: msg(`b${i}`) })).headers.get('x-bascule-target'));
     assert.deepEqual(got, ['budget/m', 'budget/m', 'echo/m']);
     assert.equal(hits.budget, 2);
+  });
+  await test('daily quota reset time (OpenRouter) parks the target until then', async () => {
+    await (await post({ model: 'daily', messages: msg() })).json();
+    await (await post({ model: 'daily', messages: msg() })).json();
+    assert.equal(hits.daily, 1, 'no second call before the stated reset');
+    assert.ok((await stats()).targets['daily/m#0'].coolingForS > 3 * 3600 - 60);
   });
   await test('per-minute quota stated in a 429 is learned and respected', async () => {
     await (await post({ model: 'learn', messages: msg() })).json(); // 429 teaches rpm = 1, falls back to echo
@@ -385,6 +394,11 @@ try {
     assert.equal(events(txt).map((c) => c.choices[0]?.delta?.content || '').join(''), 'Bonjour');
     assert.ok(txt.endsWith('data: [DONE]\n\n'));
   });
+  await test('code indentation in prompts is preserved', async () => {
+    const code = 'def f(x):\n    if x:\n        return 1';
+    const j = await (await post({ model: 'echo/m', messages: msg(code) })).json();
+    assert.equal(j.choices[0].message.content, `echo:${code}`);
+  });
   await test('bare model name resolves to its provider', async () => {
     const r = await post({ model: 'only-here', messages: msg() });
     assert.equal(r.headers.get('x-bascule-target'), 'echo/only-here');
@@ -458,6 +472,13 @@ try {
     r = await post({ model: 'blank', stream: true, messages: msg('b') });
     assert.equal(r.headers.get('x-bascule-target'), 'echo/m');
     assert.ok((await r.text()).includes('Bon'));
+  });
+  await test('named in-stream error code maps to 429 with its retry delay', async () => {
+    const r = await post({ model: 'named', stream: true, messages: msg() });
+    assert.equal(r.headers.get('x-bascule-target'), 'echo/m');
+    await r.text();
+    const c = (await stats()).targets['namedErr/m#0'].coolingForS;
+    assert.ok(c > 30 && c <= 40, `cooling ${c}s`);
   });
   await test('empty stream falls back', async () => {
     const r = await post({ model: 'sempty', stream: true, messages: msg() });

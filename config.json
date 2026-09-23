@@ -6,7 +6,6 @@
   "idleTimeoutMs": 60000,
   "maxWaitMs": 20000,
   "hedgeMs": 0,
-  "compactWhitespace": true,
   "cache": { "maxEntries": 500, "ttlMs": 600000, "always": false },
   "corsOrigins": [],
   "log": true,
