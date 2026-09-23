@@ -38,7 +38,21 @@ const sse = (res) => { res.writeHead(200, { 'content-type': 'text/event-stream' 
 const echo = await mock('echo', (req, res, body) => {
   if (req.method === 'GET' && req.url.endsWith('/models')) return json(res, { object: 'list', data: [{ id: 'models/m' }, { id: 'only-here' }] });
   if (req.url.endsWith('/embeddings')) return json(res, { object: 'list', data: [{ embedding: [0.1, 0.2] }], model: body.model });
-  if (!body.stream) return json(res, completion(`echo:${body.messages.at(-1).content}`, body.model));
+  const last = body.messages.at(-1);
+  if (body.tools && last.role === 'user' && String(last.content).includes('use the tool')) {
+    const call = { id: 'call_1', type: 'function', function: { name: body.tools[0].function.name, arguments: '{"city":"Lyon"}' } };
+    if (!body.stream) return json(res, { id: 'y', choices: [{ index: 0, message: { role: 'assistant', content: null, tool_calls: [call] }, finish_reason: 'tool_calls' }],
+      usage: { prompt_tokens: 9, completion_tokens: 4, total_tokens: 13 } });
+    const w = sse(res);
+    w({ choices: [{ index: 0, delta: { role: 'assistant', content: 'Je regarde' } }] });
+    w({ choices: [{ index: 0, delta: { tool_calls: [{ index: 0, id: 'call_1', type: 'function', function: { name: call.function.name, arguments: '' } }] } }] });
+    w({ choices: [{ index: 0, delta: { tool_calls: [{ index: 0, function: { arguments: '{"city":' } }] } }] });
+    w({ choices: [{ index: 0, delta: { tool_calls: [{ index: 0, function: { arguments: '"Lyon"}' } }] } }] });
+    w({ choices: [{ index: 0, delta: {}, finish_reason: 'tool_calls' }] });
+    w({ choices: [], usage: { prompt_tokens: 9, completion_tokens: 4, total_tokens: 13 } });
+    return res.end('data: [DONE]\n\n');
+  }
+  if (!body.stream) return json(res, completion(`echo:${typeof last.content === 'string' ? last.content : JSON.stringify(last.content)}`, body.model));
   const w = sse(res);
   for (const t of ['Bon', 'jour']) w({ choices: [{ index: 0, delta: { content: t } }] });
   // Nested usage details: a naive regex would stop at the first closing brace.
@@ -124,18 +138,18 @@ const dir = mkdtempSync(join(tmpdir(), 'bascule-'));
 const port = 20000 + Math.floor(Math.random() * 9000);
 const P = (baseUrl, extra = {}) => ({ baseUrl, keys: ['k'], models: ['m'], ...extra });
 writeFileSync(join(dir, 'config.json'), JSON.stringify({
-  port, apiKey: 'secret', corsOrigins: ['http://localhost:5173'],
+  port, apiKey: 'secret', corsOrigins: ['http://localhost:5173'], aliases: { 'claude-haiku-*': 'quick', 'claude-*': 'smart' },
   firstByteTimeoutMs: 300, idleTimeoutMs: 300, timeoutMs: 400, maxWaitMs: 1000,
   providers: {
     echo: P(echo, { models: ['m', 'only-here'] }), limited: P(limited, { keys: ['k1', 'k2'] }), limitedDate: P(limitedDate),
     badKey: P(badKey, { keys: ['bad', 'good'] }), badKey400: P(badKey400, { keys: ['bad', 'good'] }), broken: P(broken, { keys: ['k1', 'k2', 'k3'] }), badReq: P(badReq), tooLong: P(tooLong),
     tooBig: P(tooBig), streamErr: P(streamErr), streamEmpty: P(streamEmpty), streamCut: P(streamCut), streamStall: P(streamStall),
-    silent: P(silent), flaky429: P(flaky429), shared: P(shared), budget: P(budget, { rpm: 2 }), quota: P(quota), slowBody: P(slowBody), garbage: P(garbage), hang: P(hang), fast: P(fast), slow: P(slow), fresh: P(fast), textOnly: P(textOnly), noTools: P(noTools),
+    silent: P(silent), flaky429: P(flaky429), shared: P(shared), budget: P(budget, { rpm: 2 }), quota: P(quota), slowBody: P(slowBody), garbage: P(garbage), hang: P(hang), fast: P(fast), slow: P(slow), fresh: P(fast), tuned: P(fast, { minMaxTokens: 1024, params: { reasoning_effort: 'low' } }), textOnly: P(textOnly), noTools: P(noTools),
     an: P(anthropic, { type: 'anthropic', keys: ['ak'], models: ['claude'] }), anCrlf: P(anthropicCrlf, { type: 'anthropic' }), anErr: P(anthropicErr, { type: 'anthropic' }),
     off: { baseUrl: 'http://127.0.0.1:1', keys: ['${UNSET_VAR}'], models: ['x'] },
   },
   combos: {
-    auto: ['limited/m', 'echo/m'], dated: ['limitedDate/m', 'echo/m'], keys: ['badKey/m'], keys400: ['badKey400/m'], dead: ['broken/m', 'echo/m'],
+    auto: ['limited/m', 'echo/m'], smart: ['echo/m'], quick: ['fast/m'], dated: ['limitedDate/m', 'echo/m'], keys: ['badKey/m'], keys400: ['badKey400/m'], dead: ['broken/m', 'echo/m'],
     badreq: ['badReq/m', 'echo/m'], toolong: ['tooLong/m', 'echo/m'], toobig: ['tooBig/m', 'echo/m'],
     serr: ['streamErr/m', 'echo/m'], sempty: ['streamEmpty/m', 'echo/m'], scut: ['streamCut/m', 'echo/m'], sstall: ['streamStall/m'],
     silent: ['silent/m', 'echo/m'], slowbody: ['slowBody/m', 'echo/m'], garbage: ['garbage/m', 'echo/m'], hang: ['hang/m'],
@@ -317,6 +331,17 @@ try {
     assert.equal(r.headers.get('x-bascule-target'), 'echo/m');
     assert.equal((await post({ model: 'toolsc', messages: msg() })).headers.get('x-bascule-target'), 'noTools/m');
   });
+  await test('provider params and minMaxTokens apply, client values win', async () => {
+    await (await post({ model: 'tuned/m', max_tokens: 50, messages: msg() })).json();
+    assert.equal(seen.fast.body.max_tokens, 1024);
+    assert.equal(seen.fast.body.reasoning_effort, 'low');
+    await (await post({ model: 'tuned/m', max_tokens: 4000, reasoning_effort: 'high', messages: msg() })).json();
+    assert.equal(seen.fast.body.max_tokens, 4000);
+    assert.equal(seen.fast.body.reasoning_effort, 'high');
+    await (await post({ model: 'fast/m', max_tokens: 50, messages: msg() })).json();
+    assert.equal(seen.fast.body.max_tokens, 50, 'untuned provider keeps the client value');
+    assert.ok(!('reasoning_effort' in seen.fast.body));
+  });
   await test('bare model name resolves to its provider', async () => {
     const r = await post({ model: 'only-here', messages: msg() });
     assert.equal(r.headers.get('x-bascule-target'), 'echo/only-here');
@@ -454,6 +479,97 @@ try {
     const r = await post({ model: 'anerr', stream: true, messages: msg() });
     assert.equal(r.headers.get('x-bascule-target'), 'echo/m');
     await r.text();
+  });
+
+  console.log('anthropic-format clients (/v1/messages)');
+  const amsg = (body, headers = {}) => post(body, { authorization: '', 'x-api-key': 'secret', 'anthropic-version': '2023-06-01', ...headers }, '/v1/messages');
+  const aTools = [{ name: 'meteo', description: 'weather', input_schema: { type: 'object', properties: { city: { type: 'string' } } } },
+    { type: 'web_search_20250305', name: 'web_search' }];
+  const aevents = (txt) => txt.split('\n\n').filter(Boolean).map((b) => ({ event: b.match(/^event: (.+)$/m)?.[1], data: JSON.parse(b.match(/^data: (.+)$/m)[1]) }));
+  await test('messages: system, text and alias claude-* -> smart combo', async () => {
+    const r = await amsg({ model: 'claude-sonnet-5', max_tokens: 100, system: [{ type: 'text', text: 'be brief', cache_control: { type: 'ephemeral' } }],
+      messages: [{ role: 'user', content: 'hello' }] });
+    const j = await r.json();
+    assert.equal(r.status, 200);
+    assert.equal(r.headers.get('x-bascule-target'), 'echo/m');
+    assert.equal(seen.echo.body.messages[0].content, 'be brief');
+    assert.equal(j.type, 'message');
+    assert.equal(j.role, 'assistant');
+    assert.equal(j.model, 'claude-sonnet-5');
+    assert.deepEqual(j.content, [{ type: 'text', text: 'echo:hello' }]);
+    assert.equal(j.stop_reason, 'end_turn');
+    assert.deepEqual(j.usage, { input_tokens: 5, output_tokens: 1 });
+  });
+  await test('messages: claude-haiku-* alias goes to its own combo', async () => {
+    const r = await amsg({ model: 'claude-haiku-4-5-20251001', max_tokens: 10, messages: [{ role: 'user', content: 'x' }] });
+    assert.equal(r.headers.get('x-bascule-target'), 'fast/m');
+  });
+  await test('messages: tools map both ways, server tools dropped', async () => {
+    const r = await amsg({ model: 'smart', max_tokens: 100, tools: aTools, tool_choice: { type: 'any' }, messages: [{ role: 'user', content: 'use the tool' }] });
+    const j = await r.json();
+    assert.deepEqual(seen.echo.body.tools.map((t) => t.function.name), ['meteo']);
+    assert.equal(seen.echo.body.tool_choice, 'required');
+    assert.equal(j.stop_reason, 'tool_use');
+    assert.equal(j.content[0].type, 'tool_use');
+    assert.equal(j.content[0].name, 'meteo');
+    assert.deepEqual(j.content[0].input, { city: 'Lyon' });
+  });
+  await test('messages: tool_result round trip keeps OpenAI message order', async () => {
+    await (await amsg({ model: 'smart', max_tokens: 100, tools: aTools, messages: [
+      { role: 'user', content: 'weather?' },
+      { role: 'assistant', content: [{ type: 'text', text: 'checking' }, { type: 'tool_use', id: 'toolu_1', name: 'meteo', input: { city: 'Lyon' } }] },
+      { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'toolu_1', content: [{ type: 'text', text: '20C' }] }, { type: 'text', text: 'and tomorrow?' }] }] })).json();
+    const m = seen.echo.body.messages;
+    assert.deepEqual(m.map((x) => x.role), ['user', 'assistant', 'tool', 'user']);
+    assert.equal(m[1].tool_calls[0].id, 'toolu_1');
+    assert.equal(m[2].tool_call_id, 'toolu_1');
+    assert.equal(m[2].content, '20C');
+    assert.equal(m[3].content, 'and tomorrow?');
+  });
+  await test('messages: base64 image becomes an image_url part', async () => {
+    await (await amsg({ model: 'smart', max_tokens: 10, messages: [{ role: 'user', content: [
+      { type: 'image', source: { type: 'base64', media_type: 'image/png', data: 'AAAA' } }, { type: 'text', text: 'what?' }] }] })).json();
+    assert.deepEqual(seen.echo.body.messages[0].content[0], { type: 'image_url', image_url: { url: 'data:image/png;base64,AAAA' } });
+  });
+  await test('messages: stream follows the Anthropic event sequence', async () => {
+    const r = await amsg({ model: 'smart', max_tokens: 100, stream: true, tools: aTools, messages: [{ role: 'user', content: 'use the tool' }] });
+    assert.match(r.headers.get('content-type'), /event-stream/);
+    const ev = aevents(await r.text());
+    assert.deepEqual(ev.map((e) => e.event), ['message_start', 'content_block_start', 'content_block_delta', 'content_block_stop',
+      'content_block_start', 'content_block_delta', 'content_block_delta', 'content_block_stop', 'message_delta', 'message_stop']);
+    assert.ok(ev.every((e) => e.event === e.data.type));
+    assert.equal(ev[2].data.delta.text, 'Je regarde');
+    assert.equal(ev[4].data.content_block.type, 'tool_use');
+    assert.equal(ev[4].data.index, 1);
+    assert.deepEqual(JSON.parse(ev[5].data.delta.partial_json + ev[6].data.delta.partial_json), { city: 'Lyon' });
+    assert.equal(ev[8].data.delta.stop_reason, 'tool_use');
+    assert.equal(ev[8].data.usage.output_tokens, 4);
+  });
+  await test('messages: plain text stream', async () => {
+    const ev = aevents(await (await amsg({ model: 'smart', max_tokens: 10, stream: true, messages: [{ role: 'user', content: 'hi' }] })).text());
+    assert.equal(ev.filter((e) => e.event === 'content_block_delta').map((e) => e.data.delta.text).join(''), 'Bonjour');
+    assert.equal(ev.at(-2).data.delta.stop_reason, 'end_turn');
+  });
+  await test('messages: errors come back in Anthropic shape', async () => {
+    let r = await amsg({ model: 'smart', max_tokens: 10, messages: [{ role: 'user', content: 'x' }] }, { 'x-api-key': 'wrong' });
+    assert.equal(r.status, 401);
+    assert.deepEqual(await r.json(), { type: 'error', error: { type: 'authentication_error', message: 'invalid api key' } });
+    r = await amsg({ model: 'all429', max_tokens: 10, messages: [{ role: 'user', content: 'x' }] });
+    assert.equal(r.status, 429);
+    assert.equal((await r.json()).error.type, 'rate_limit_error');
+  });
+  await test('messages: fallback works through the Anthropic endpoint too', async () => {
+    const r = await amsg({ model: 'auto', max_tokens: 10, messages: [{ role: 'user', content: 'fb' }] });
+    assert.equal(r.headers.get('x-bascule-target'), 'echo/m');
+    assert.equal((await r.json()).content[0].text, 'echo:fb');
+  });
+  await test('count_tokens answers an estimate', async () => {
+    const r = await post({ model: 'smart', messages: [{ role: 'user', content: 'x'.repeat(400) }] }, {}, '/v1/messages/count_tokens');
+    const j = await r.json();
+    assert.ok(j.input_tokens >= 100 && j.input_tokens < 130, JSON.stringify(j));
+  });
+  await test('OpenAI SDK clients do not see alias names as models', async () => {
+    assert.equal((await post({ model: 'claude-sonnet-5', messages: msg() })).headers.get('x-bascule-target'), 'echo/m', 'aliases apply to both formats');
   });
 
   console.log('other endpoints');

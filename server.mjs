@@ -118,7 +118,8 @@ function buildProviders(c) {
     if (!p.baseUrl) { console.error(`provider "${name}" has no baseUrl, ignored`); continue; }
     out[name] = { name, type: p.type || 'openai', baseUrl: p.baseUrl.replace(/\/+$/, ''),
       keys: keys.length ? keys : [''], headers: p.headers || {}, models: p.models || [],
-      streamUsage: p.streamUsage !== false, rpm: Number(p.rpm) || 0, rr: 0 };
+      streamUsage: p.streamUsage !== false, rpm: Number(p.rpm) || 0, rr: 0,
+      params: p.params && typeof p.params === 'object' ? p.params : {}, minMaxTokens: Number(p.minMaxTokens) || 0 };
   }
   return out;
 }
@@ -382,14 +383,145 @@ async function* passthrough(reader, onUsage) {
   }
 }
 
+// ---------- inbound Anthropic Messages API ----------
+// Clients that speak Anthropic's format (Claude Code, the Anthropic SDKs) are translated to the
+// internal OpenAI format on the way in, and back on the way out, so every provider serves them.
+
+// Anthropic request -> OpenAI chat request
+function fromAnthropicRequest(a) {
+  const messages = [];
+  const textOf = (c) => (typeof c === 'string' ? c : (c || []).filter((b) => b?.type === 'text').map((b) => b.text).join('\n'));
+  const sys = textOf(a.system);
+  if (sys) messages.push({ role: 'system', content: sys });
+  for (const m of a.messages || []) {
+    const blocks = typeof m.content === 'string' ? [{ type: 'text', text: m.content }] : Array.isArray(m.content) ? m.content : [];
+    if (m.role === 'assistant') {
+      const text = blocks.filter((b) => b?.type === 'text').map((b) => b.text).join('');
+      const tool_calls = blocks.filter((b) => b?.type === 'tool_use').map((b) => ({ id: b.id, type: 'function',
+        function: { name: b.name, arguments: JSON.stringify(b.input ?? {}) } }));
+      if (text || tool_calls.length) messages.push({ role: 'assistant', content: text || null, ...(tool_calls.length && { tool_calls }) });
+      continue;
+    }
+    // Tool results must directly follow the assistant turn that asked for them, before any new user text.
+    for (const b of blocks.filter((b) => b?.type === 'tool_result')) {
+      const content = textOf(b.content) || (typeof b.content === 'string' ? b.content : '');
+      messages.push({ role: 'tool', tool_call_id: b.tool_use_id, content: (b.is_error ? 'Error: ' : '') + (content || '(empty)') });
+    }
+    const parts = [];
+    for (const b of blocks) {
+      if (b?.type === 'text' && b.text) parts.push({ type: 'text', text: b.text });
+      else if (b?.type === 'image') {
+        const src = b.source || {};
+        const url = src.type === 'base64' ? `data:${src.media_type};base64,${src.data}` : src.url;
+        if (url) parts.push({ type: 'image_url', image_url: { url } });
+      } else if (b?.type === 'document' && b.source?.type === 'text') parts.push({ type: 'text', text: b.source.data });
+    }
+    if (parts.length) messages.push({ role: 'user', content: parts.every((p) => p.type === 'text') ? parts.map((p) => p.text).join('\n') : parts });
+  }
+  const out = { model: a.model, messages, max_tokens: a.max_tokens, stream: Boolean(a.stream) };
+  for (const k of ['temperature', 'top_p']) if (a[k] !== undefined) out[k] = a[k];
+  if (a.stop_sequences?.length) out.stop = a.stop_sequences;
+  // Server tools (web search...) have no input_schema and only exist on Anthropic's side.
+  const tools = (a.tools || []).filter((t) => t?.input_schema);
+  if (tools.length) {
+    out.tools = tools.map((t) => ({ type: 'function', function: { name: t.name, description: t.description, parameters: t.input_schema } }));
+    const tc = a.tool_choice;
+    if (tc?.type === 'any') out.tool_choice = 'required';
+    else if (tc?.type === 'none') out.tool_choice = 'none';
+    else if (tc?.type === 'tool') out.tool_choice = { type: 'function', function: { name: tc.name } };
+  }
+  return out;
+}
+
+const STOP_TO_ANTHROPIC = { stop: 'end_turn', length: 'max_tokens', tool_calls: 'tool_use', function_call: 'tool_use', content_filter: 'refusal' };
+const toolId = (id) => (id && /^[\w-]+$/.test(id) ? id : 'toolu_' + randomBytes(12).toString('hex'));
+
+// OpenAI chat response -> Anthropic message
+function toAnthropicMessage(o, model) {
+  const c = o.choices?.[0] || {}, m = c.message || {};
+  const content = [];
+  if (m.content) content.push({ type: 'text', text: m.content });
+  for (const tc of m.tool_calls || []) {
+    let input = {};
+    try { input = JSON.parse(tc.function?.arguments || '{}'); } catch {}
+    content.push({ type: 'tool_use', id: toolId(tc.id), name: tc.function?.name, input });
+  }
+  const u = o.usage || {};
+  return { id: 'msg_' + String(o.id || randomBytes(12).toString('hex')).replace(/\W/g, ''), type: 'message', role: 'assistant', model,
+    content, stop_reason: STOP_TO_ANTHROPIC[c.finish_reason] || 'end_turn', stop_sequence: null,
+    usage: { input_tokens: u.prompt_tokens || 0, output_tokens: u.completion_tokens || 0 } };
+}
+
+// OpenAI SSE (as produced by pipeStream's generators) -> Anthropic SSE events.
+async function* toAnthropicStream(gen, model) {
+  const ev = (type, d) => `event: ${type}\ndata: ${JSON.stringify({ type, ...d })}\n\n`;
+  let buf = '', started = false, block = -1, open = null, finish = null, usage = null;
+  const tools = new Map(); // openai tool index -> anthropic block index
+  const close = () => (open ? (open = null, ev('content_block_stop', { index: block })) : '');
+  for await (const raw of gen) {
+    if (!started) {
+      started = true;
+      yield ev('message_start', { message: { id: 'msg_' + randomBytes(12).toString('hex'), type: 'message', role: 'assistant', model,
+        content: [], stop_reason: null, stop_sequence: null, usage: { input_tokens: 0, output_tokens: 0 } } });
+    }
+    buf = (buf + raw).replace(/\r\n/g, '\n');
+    let i, out = '';
+    while ((i = buf.indexOf('\n\n')) >= 0) {
+      const line = buf.slice(0, i).split('\n').find((l) => l.startsWith('data:'));
+      buf = buf.slice(i + 2);
+      if (!line) continue;
+      let d;
+      try { d = JSON.parse(line.slice(5)); } catch { continue; } // [DONE] and keep-alives
+      if (d.usage) usage = d.usage;
+      const c = d.choices?.[0];
+      if (!c) continue;
+      const delta = c.delta || {};
+      if (delta.content) {
+        if (open !== 'text') { out += close(); block++; open = 'text'; out += ev('content_block_start', { index: block, content_block: { type: 'text', text: '' } }); }
+        out += ev('content_block_delta', { index: block, delta: { type: 'text_delta', text: delta.content } });
+      }
+      for (const tc of delta.tool_calls || []) {
+        const k = tc.index ?? 0;
+        if (!tools.has(k)) {
+          out += close(); block++; open = 'tool'; tools.set(k, block);
+          out += ev('content_block_start', { index: block, content_block: { type: 'tool_use', id: toolId(tc.id), name: tc.function?.name || '', input: {} } });
+        }
+        if (tc.function?.arguments && tools.get(k) === block)
+          out += ev('content_block_delta', { index: block, delta: { type: 'input_json_delta', partial_json: tc.function.arguments } });
+      }
+      if (c.finish_reason) finish = c.finish_reason;
+    }
+    if (out) yield out;
+  }
+  if (!started) throw new Upstream(502, 'empty stream');
+  yield close() + ev('message_delta', { delta: { stop_reason: STOP_TO_ANTHROPIC[finish] || 'end_turn', stop_sequence: null },
+    usage: { input_tokens: usage?.prompt_tokens || 0, output_tokens: usage?.completion_tokens || 0 } }) + ev('message_stop', {});
+}
+
+// Claude Code asks for claude-* models by name. Aliases map such names onto combos or targets.
+function aliasFor(model) {
+  for (const [pattern, target] of Object.entries(cfg.aliases || {})) {
+    const re = new RegExp('^' + pattern.split('*').map((x) => x.replace(/[.+?^${}()|[\]\\]/g, '\\$&')).join('.*') + '$');
+    if (re.test(model)) return target;
+  }
+  return null;
+}
+
 // ---------- upstream call ----------
 function buildRequest(t, key, body, endpoint) {
   const p = t.provider;
+  // Reasoning models spend part of max_tokens thinking before they write; a small client budget
+  // can leave nothing for the answer. minMaxTokens raises the floor for such providers.
+  if (p.minMaxTokens && endpoint === '/chat/completions') {
+    const k = body.max_completion_tokens !== undefined ? 'max_completion_tokens' : 'max_tokens';
+    if (body[k] !== undefined && body[k] < p.minMaxTokens) body = { ...body, [k]: p.minMaxTokens };
+  }
   if (p.type === 'anthropic') {
     return { url: `${p.baseUrl}/v1/messages`, payload: toAnthropic(body, t.model),
       headers: { 'x-api-key': key, 'anthropic-version': '2023-06-01', ...p.headers } };
   }
-  const payload = { ...body, model: t.model };
+  // Provider defaults (e.g. reasoning_effort) never override what the client asked for.
+  const payload = { ...(endpoint === '/chat/completions' ? p.params : {}), ...body, model: t.model };
   // Some OpenAI-compatible APIs (Groq) only accept string content. A text-only parts array
   // means exactly the same thing as its joined text, so send that.
   if (Array.isArray(body.messages) && body.messages.some((m) => Array.isArray(m?.content)))
@@ -562,17 +694,18 @@ async function route(res, body, { endpoint, requested, cacheable }) {
   stats.requests++;
   const t0 = Date.now();
   let targets = resolve(requested);
+  if (!targets.length && aliasFor(requested)) targets = resolve(aliasFor(requested));
   if (endpoint !== '/chat/completions') targets = targets.filter((t) => t.provider.type === 'openai');
   if (!targets.length) return send(res, 404, err(`unknown model "${requested}"`, 'model_not_found'));
 
   const ck = cacheable && CACHE_MAX > 0 ? cacheKey({ endpoint, ...body, model: requested }) : null;
   if (ck) {
     const hit = cacheGet(ck);
-    if (hit) { stats.cacheHits++; log(200, requested, 'cache', t0, 0); return send(res, 200, hit, { 'x-bascule-cache': 'hit' }); }
+    if (hit) { stats.cacheHits++; log(200, requested, 'cache', t0, 0); return send(res, 200, shape(res, hit, requested), { 'x-bascule-cache': 'hit' }); }
     const shared = inflight.get(ck);
     if (shared) {
       const out = await shared;
-      if (out) { stats.cacheHits++; log(200, requested, 'shared', t0, 0); return send(res, 200, out, { 'x-bascule-cache': 'shared' }); }
+      if (out) { stats.cacheHits++; log(200, requested, 'shared', t0, 0); return send(res, 200, shape(res, out, requested), { 'x-bascule-cache': 'shared' }); }
     }
   }
   let share = null;
@@ -623,13 +756,13 @@ async function attempt(res, body, { endpoint, requested, targets: allTargets, ck
       try {
         up = await callOnce(t, k, body, clientAbort.signal, endpoint);
         let out = null;
-        if (body.stream) await pipeStream(up, t, res, head);
+        if (body.stream) await pipeStream(up, t, res, head, requested);
         else {
           const raw = await readJson(up.reader);
           out = t.provider.type === 'anthropic' ? fromAnthropic(raw, t.model) : raw;
           addUsage(out.usage);
           if (ck) cacheSet(ck, out);
-          send(res, 200, out, head);
+          send(res, 200, shape(res, out, requested), head);
         }
         success(k.hid, Date.now() - up.t0);
         log(200, requested, t.id, t0, tries - 1);
@@ -641,7 +774,9 @@ async function attempt(res, body, { endpoint, requested, targets: allTargets, ck
         cooldown(k.hid, status, e.retryAfter);
         if (e.rpm) h(k.hid).learnedRpm = e.rpm;
         if (res.headersSent) { // mid-stream: bytes already left, report in-band and stop
-          res.end(`data: ${JSON.stringify(err(`upstream ${t.id} failed mid-stream: ${e.message}`, 'upstream_error'))}\n\n`);
+          const msg = `upstream ${t.id} failed mid-stream: ${e.message}`;
+          res.end(res.anthropic ? `event: error\ndata: ${JSON.stringify({ type: 'error', error: { type: 'api_error', message: msg } })}\n\n`
+            : `data: ${JSON.stringify(err(msg, 'upstream_error'))}\n\n`);
           log(502, requested, t.id, t0, tries - 1);
           return null;
         }
@@ -694,8 +829,12 @@ async function readJson(reader) {
   try { return JSON.parse(s); } catch { throw new Upstream(502, `invalid JSON from upstream: ${s.slice(0, 120)}`); }
 }
 
-async function pipeStream(up, t, res, head) {
-  const gen = t.provider.type === 'anthropic' ? anthropicStream(up.reader, t.model, addUsage) : passthrough(up.reader, addUsage);
+// Responses are kept in OpenAI form internally (cache included) and shaped per client on the way out.
+const shape = (res, out, model) => (res.anthropic ? toAnthropicMessage(out, model) : out);
+
+async function pipeStream(up, t, res, head, model) {
+  let gen = t.provider.type === 'anthropic' ? anthropicStream(up.reader, t.model, addUsage) : passthrough(up.reader, addUsage);
+  if (res.anthropic) gen = toAnthropicStream(gen, model);
   // Pull the first chunk before committing headers: allows fallback if upstream dies instantly.
   const first = await gen.next();
   res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache',
@@ -731,8 +870,12 @@ function log(code, model, target, t0, fallbacks) {
 
 // ---------- http ----------
 const err = (message, code) => ({ error: { message, type: code, code } });
+const ANTHROPIC_ERROR = { 400: 'invalid_request_error', 401: 'authentication_error', 403: 'permission_error', 404: 'not_found_error',
+  413: 'request_too_large', 415: 'invalid_request_error', 429: 'rate_limit_error', 503: 'overloaded_error', 529: 'overloaded_error' };
 function send(res, code, obj, headers = {}) {
   if (res.headersSent) return res.end();
+  // Anthropic-format clients get Anthropic-shaped errors.
+  if (res.anthropic && obj?.error) obj = { type: 'error', error: { type: ANTHROPIC_ERROR[code] || 'api_error', message: obj.error.message } };
   const s = JSON.stringify(obj);
   res.writeHead(code, { 'content-type': 'application/json', 'content-length': Buffer.byteLength(s), ...headers });
   res.end(s);
@@ -832,7 +975,8 @@ async function printStatus() {
   return true;
 }
 
-const ENDPOINTS = { '/v1/chat/completions': '/chat/completions', '/v1/embeddings': '/embeddings' };
+const ENDPOINTS = { '/v1/chat/completions': '/chat/completions', '/v1/embeddings': '/embeddings',
+  '/v1/messages': 'anthropic', '/v1/messages/count_tokens': 'count_tokens' };
 
 if (arg === 'doctor') process.exit((await doctor(process.argv.includes('--deep'))) ? 0 : 1);
 if (arg === 'status') process.exit((await printStatus()) ? 0 : 1);
@@ -853,6 +997,8 @@ const server = http.createServer(async (req, res) => {
     return res.end();
   }
   if (path === '/health') return send(res, 200, { ok: true });
+  // Known before auth, so even a rejected Anthropic-format client gets an error it can parse.
+  res.anthropic = /^(\/v1)?\/messages(\/count_tokens)?$/.test(path);
   if (!authed(req)) return send(res, 401, err('invalid api key', 'unauthorized'));
   try {
     if (req.method === 'GET' && (path === '/v1/models' || path === '/models')) return send(res, 200, listModels());
@@ -870,6 +1016,17 @@ const server = http.createServer(async (req, res) => {
       }
       if (!body || typeof body !== 'object' || Array.isArray(body)) return send(res, 400, err('body must be a JSON object', 'invalid_request'));
       const requested = typeof body.model === 'string' && body.model ? body.model : cfg.defaultModel || '';
+      if (endpoint === 'count_tokens') {
+        // No provider-neutral tokenizer: about 4 characters per token is close enough for budgeting.
+        const chars = JSON.stringify([body.system, body.messages, body.tools]).length;
+        return send(res, 200, { input_tokens: Math.ceil(chars / 4) });
+      }
+      if (endpoint === 'anthropic') {
+        if (!Array.isArray(body.messages) || !body.messages.length) return send(res, 400, err('messages must be a non-empty array', 'invalid_request'));
+        const oai = compact(fromAnthropicRequest(body));
+        return await route(res, oai, { endpoint: '/chat/completions', requested,
+          cacheable: !oai.stream && (oai.temperature === 0 || cfg.cache?.always === true) });
+      }
       if (endpoint === '/chat/completions') {
         if (!Array.isArray(body.messages) || !body.messages.length) return send(res, 400, err('messages must be a non-empty array', 'invalid_request'));
         compact(body);

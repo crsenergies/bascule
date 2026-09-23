@@ -10,13 +10,14 @@
   "corsOrigins": [],
   "log": true,
   "defaultModel": "auto",
+  "aliases": { "claude-haiku-*": "fast", "claude-*": "smart" },
 
   "providers": {
-    "groq":       { "type": "openai", "baseUrl": "https://api.groq.com/openai/v1", "keys": ["${GROQ_API_KEY}", "${GROQ_API_KEY_2}"],
+    "groq":       { "type": "openai", "baseUrl": "https://api.groq.com/openai/v1", "keys": ["${GROQ_API_KEY}", "${GROQ_API_KEY_2}"], "minMaxTokens": 1024,
                     "models": ["openai/gpt-oss-120b", "openai/gpt-oss-20b", "qwen/qwen3.8-27b"] },
-    "cerebras":   { "type": "openai", "baseUrl": "https://api.cerebras.ai/v1", "keys": ["${CEREBRAS_API_KEY}"],
+    "cerebras":   { "type": "openai", "baseUrl": "https://api.cerebras.ai/v1", "keys": ["${CEREBRAS_API_KEY}"], "minMaxTokens": 1024,
                     "models": ["gpt-oss-120b", "qwen-3.8-27b"] },
-    "gemini":     { "type": "openai", "baseUrl": "https://generativelanguage.googleapis.com/v1beta/openai", "keys": ["${GEMINI_API_KEY}"],
+    "gemini":     { "type": "openai", "baseUrl": "https://generativelanguage.googleapis.com/v1beta/openai", "keys": ["${GEMINI_API_KEY}"], "minMaxTokens": 1024,
                     "models": ["gemini-3.8-flash", "gemini-3.5-flash-lite"] },
     "openrouter": { "type": "openai", "baseUrl": "https://openrouter.ai/api/v1", "keys": ["${OPENROUTER_API_KEY}"],
                     "models": ["openrouter/free", "qwen/qwen3.8-27b:free", "google/gemma-4-31b-it:free"] },
@@ -36,7 +37,8 @@
     "auto":  ["groq/openai/gpt-oss-120b", "cerebras/gpt-oss-120b", "gemini/gemini-3.5-flash-lite",
               "openrouter/openrouter/free", "mistral/mistral-small-latest", "deepseek/deepseek-flash", "ollama/qwen2.5:3b"],
     "fast":  { "strategy": "fastest", "targets": ["groq/openai/gpt-oss-20b", "cerebras/gpt-oss-120b", "gemini/gemini-3.5-flash-lite"] },
-    "smart": ["anthropic/claude-sonnet-5", "gemini/gemini-3.8-flash", "openai/gpt-6-sol", "deepseek/deepseek-v4-pro", "groq/openai/gpt-oss-120b"],
+    "smart": ["anthropic/claude-sonnet-5", "gemini/gemini-3.8-flash", "openai/gpt-6-sol", "deepseek/deepseek-v4-pro",
+              "openrouter/openrouter/free", "groq/openai/gpt-oss-120b", "gemini/gemini-3.5-flash-lite"],
     "local": ["ollama/qwen2.5:3b"]
   }
 }
