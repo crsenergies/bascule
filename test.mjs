@@ -229,6 +229,14 @@ try {
     const st = await stats();
     assert.deepEqual(st.combos.hedge, ['tortoise/m', 'fast/m']);
   });
+  await test('stats count answers per combo and target', async () => {
+    const total = (st) => Object.values(st.served.nohedge || {}).reduce((a, b) => a + b, 0);
+    const before = total(await stats());
+    assert.equal((await post({ model: 'nohedge', messages: msg('served count') })).status, 200);
+    const st = await stats();
+    assert.equal(total(st), before + 1);
+    assert.ok(!st.served['echo/m'], 'direct model names are not combos');
+  });
   await test('bad JSON gives 400', async () => assert.equal((await post('{nope')).status, 400));
   await test('JSON that is not an object gives 400', async () => assert.equal((await post('[1,2]')).status, 400));
   await test('empty messages give 400', async () => assert.equal((await post({ model: 'auto', messages: [] })).status, 400));

@@ -732,6 +732,8 @@ function cacheSet(k, v) {
 
 // ---------- stats ----------
 const stats = { requests: 0, cacheHits: 0, fallbacks: 0, hedges: 0, failures: 0, tokens: { prompt: 0, completion: 0 } };
+// Answers per combo and target: the dashboard animates each new one along its line.
+const served = {};
 const addUsage = (u) => { if (u) { stats.tokens.prompt += u.prompt_tokens || 0; stats.tokens.completion += u.completion_tokens || 0; } };
 
 // ---------- routing ----------
@@ -908,6 +910,7 @@ async function attempt(res, body, { endpoint, requested, targets: allTargets, ck
           send(res, 200, shape(res, out, requested), head);
         }
         success(k.hid, Date.now() - up.t0);
+        if (Object.hasOwn(cfg.combos || {}, requested)) (served[requested] ??= {})[t.id] = (served[requested][t.id] || 0) + 1;
         log(200, requested, t.id, t0, tries - 1);
         return out;
       } catch (e) {
@@ -1014,7 +1017,7 @@ function status() {
   const combos = Object.fromEntries(Object.entries(cfg.combos || {}).map(([name, c]) =>
     [name, (Array.isArray(c) ? c : c.targets || []).map((t) => parseTarget(t)?.id).filter(Boolean)]));
   return { version: VERSION, uptimeS: Math.round(process.uptime()), providers: Object.keys(providers), cannot,
-    cacheSize: cache.size, ...stats, combos, targets };
+    cacheSize: cache.size, ...stats, combos, served, targets };
 }
 
 function log(code, model, target, t0, fallbacks) {
@@ -1151,134 +1154,170 @@ if (arg === 'dashboard') {
 
 // ---------- dashboard ----------
 // One self-contained page, no external assets. The strict CSP pins the inline style and script by hash.
-// Each combo is drawn as a railway line: requests leave from the left and stop at the first open station.
+// Each combo is drawn as a transit line: a request leaves the first station and stops at the first
+// open one. Every answer seen since the last refresh runs along its line as a small train.
 const DASHBOARD_CSS = `
 :root { color-scheme: light dark;
-  --paper: #f2f4f7; --panel: #ffffff; --ink: #14233a; --soft: #5b6b80; --rule: #d9dfe7; --track: #14233a;
-  --go: #1f9d55; --wait: #e09b14; --stop: #d8433b; --idle: #a7b0bc;
-  --round: ui-rounded, "SF Pro Rounded", "Nunito", "Varela Round", system-ui, sans-serif;
-  --text: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+  --paper: #f3f4f6; --panel: #ffffff; --ink: #0f1c2e; --soft: #5a6a7e; --faint: #8795a8; --rule: #dde2e9;
+  --go: #16874a; --wait: #c77c02; --stop: #cc3a32; --idle: #b3bcc8;
+  --sans: "Helvetica Neue", Helvetica, "Arial Nova", Arial, system-ui, sans-serif;
+  --mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace; }
 @media (prefers-color-scheme: dark) {
-  :root { --paper: #0e1726; --panel: #16223a; --ink: #e8eef6; --soft: #9aabc2; --rule: #27364f; --track: #c9d5e6; --idle: #53627a; }
+  :root { --paper: #0c1522; --panel: #131f30; --ink: #eaf0f7; --soft: #a0b0c4; --faint: #71839b; --rule: #243349;
+    --go: #34b86d; --wait: #e6a23c; --stop: #ef5a50; --idle: #4d5d74; }
 }
 * { box-sizing: border-box; }
-body { margin: 0; background: var(--paper); color: var(--ink); font: 16px/1.5 var(--text); -webkit-font-smoothing: antialiased; }
-main { max-width: 1040px; margin: 0 auto; padding: 28px 24px 64px; }
-:focus-visible { outline: 3px solid var(--go); outline-offset: 2px; border-radius: 4px; }
+body { margin: 0; background: var(--paper); color: var(--ink); font: 16px/1.5 var(--sans); -webkit-font-smoothing: antialiased; }
+main { max-width: 1080px; margin: 0 auto; padding: 0 28px 72px; }
+:focus-visible { outline: 3px solid var(--ink); outline-offset: 3px; border-radius: 4px; }
+button { font: inherit; cursor: pointer; }
 
-.top { display: flex; align-items: center; gap: 10px; margin-bottom: 48px; }
-.brand { display: flex; align-items: center; gap: 10px; font: 700 20px var(--round); letter-spacing: -.01em; }
-.brand svg { width: 30px; height: 30px; }
-.top .meta { color: var(--soft); font-size: 14px; margin-left: auto; text-align: right; }
-.pulse { display: inline-block; width: 9px; height: 9px; border-radius: 50%; background: var(--go); margin-right: 7px; vertical-align: 1px; }
+.top { display: flex; align-items: center; gap: 12px; padding: 22px 0; border-bottom: 1px solid var(--rule); margin-bottom: 56px; }
+.brand { display: flex; align-items: center; gap: 10px; font-weight: 700; font-size: 19px; letter-spacing: -.01em; }
+.brand svg { width: 28px; height: 28px; }
+.meta { margin-left: auto; color: var(--soft); font-size: 14px; display: flex; align-items: center; gap: 8px; }
+.pulse { width: 8px; height: 8px; border-radius: 50%; background: var(--go); }
 .pulse.down { background: var(--stop); }
 
-.hero h1 { font: 800 clamp(34px, 6vw, 60px)/1.04 var(--round); letter-spacing: -.025em; margin: 0 0 14px; max-width: 16ch; }
-.hero p { font-size: clamp(17px, 2vw, 20px); color: var(--soft); margin: 0; max-width: 60ch; }
+.hero { display: grid; grid-template-columns: auto 1fr; column-gap: 22px; align-items: start; margin-bottom: 44px; }
+.signal { width: 22px; height: 22px; border-radius: 50%; margin-top: .32em; background: var(--go);
+  box-shadow: 0 0 0 6px color-mix(in srgb, var(--go) 18%, transparent); }
+.signal.warn { background: var(--wait); box-shadow: 0 0 0 6px color-mix(in srgb, var(--wait) 20%, transparent); }
+.signal.bad { background: var(--stop); box-shadow: 0 0 0 6px color-mix(in srgb, var(--stop) 20%, transparent); }
+.signal.idle { background: var(--idle); box-shadow: 0 0 0 6px color-mix(in srgb, var(--idle) 25%, transparent); }
+.hero h1 { font-size: clamp(30px, 5vw, 52px); line-height: 1.06; letter-spacing: -.03em; font-weight: 700; margin: 0 0 12px; max-width: 22ch; }
+.hero p { grid-column: 2; font-size: clamp(16px, 1.8vw, 19px); color: var(--soft); margin: 0; max-width: 62ch; }
 .hero p strong { color: var(--ink); font-weight: 600; }
-.hero .code { font-family: ui-monospace, Menlo, monospace; font-size: .9em; background: var(--panel); border: 1px solid var(--rule); padding: 1px 6px; border-radius: 5px; color: var(--ink); }
+.code { font-family: var(--mono); font-size: .86em; background: var(--panel); border: 1px solid var(--rule); padding: 1px 6px; border-radius: 5px; color: var(--ink); white-space: nowrap; }
 
-.numbers { display: flex; flex-wrap: wrap; margin: 40px 0 56px; border-top: 1px solid var(--rule); border-bottom: 1px solid var(--rule); }
-.numbers div { flex: 1 1 150px; padding: 18px 20px 18px 0; }
-.numbers div + div { padding-left: 20px; border-left: 1px solid var(--rule); }
-.numbers b { display: block; font: 800 34px/1.1 var(--round); font-variant-numeric: tabular-nums; letter-spacing: -.02em; }
+.numbers { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); margin: 0 0 64px; background: var(--panel);
+  border: 1px solid var(--rule); border-radius: 14px; }
+.numbers div { padding: 18px 22px; }
+.numbers div + div { border-left: 1px solid var(--rule); }
+.numbers b { display: block; font-size: 32px; line-height: 1.1; font-weight: 700; letter-spacing: -.02em; font-variant-numeric: tabular-nums; }
 .numbers span { color: var(--soft); font-size: 14px; }
 .numbers .bad b { color: var(--stop); }
 
-h2 { font: 700 22px var(--round); margin: 0 0 4px; letter-spacing: -.01em; }
-.lead { color: var(--soft); margin: 0 0 24px; max-width: 64ch; }
-
-.line { background: var(--panel); border: 1px solid var(--rule); border-radius: 18px; padding: 20px 24px 22px; margin-bottom: 14px; }
-.line header { display: flex; align-items: baseline; gap: 12px; flex-wrap: wrap; margin-bottom: 18px; }
-.line header strong { font: 800 20px var(--round); }
-.line header span { color: var(--soft); font-size: 15px; }
-.line header span b { color: var(--ink); font-weight: 600; }
-.line.blocked { border-color: var(--stop); }
-.stops { list-style: none; margin: 0; padding: 0; display: flex; }
-.stop { position: relative; flex: 1 1 0; min-width: 0; padding-top: 34px; padding-right: 10px; }
-.stop::before { content: ""; position: absolute; top: 12px; left: 0; right: 0; height: 6px; background: var(--track); opacity: .9; }
-.stop:first-child::before { left: 12px; }
-.stop:last-child::before { right: calc(100% - 13px); }
-.stop:only-child::before { display: none; }
-.dot { position: absolute; top: 3px; left: 2px; width: 24px; height: 24px; border-radius: 50%; background: var(--panel); border: 6px solid var(--idle); }
-.go .dot { border-color: var(--go); } .wait .dot { border-color: var(--wait); } .stopped .dot { border-color: var(--stop); background: var(--stop); }
-.head .dot { border-color: var(--go); background: var(--go); box-shadow: 0 0 0 0 var(--go); animation: ring 2.4s ease-out infinite; }
-@keyframes ring { 0% { box-shadow: 0 0 0 0 color-mix(in srgb, var(--go) 55%, transparent); } 70%, 100% { box-shadow: 0 0 0 12px transparent; } }
-.stop .who { display: block; font-size: 12px; color: var(--soft); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.stop .what { display: block; font-weight: 600; font-size: 15px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.stop .how { display: block; font-size: 13px; margin-top: 2px; color: var(--soft); }
-.go .how { color: var(--go); } .wait .how { color: var(--wait); } .stopped .how { color: var(--stop); }
-
-.legend { display: flex; flex-wrap: wrap; gap: 8px 22px; margin: 18px 0 48px; color: var(--soft); font-size: 14px; padding: 0; list-style: none; }
-.legend i { display: inline-block; width: 12px; height: 12px; border-radius: 50%; border: 3px solid var(--idle); margin-right: 7px; vertical-align: -1px; }
+.section-head { display: flex; align-items: end; justify-content: space-between; gap: 16px; flex-wrap: wrap; margin-bottom: 20px; }
+h2 { font-size: 24px; letter-spacing: -.02em; margin: 0 0 4px; }
+.lead { color: var(--soft); margin: 0; max-width: 62ch; }
+.legend { display: flex; flex-wrap: wrap; gap: 6px 18px; color: var(--soft); font-size: 13px; padding: 0; margin: 0; list-style: none; }
+.legend i { display: inline-block; width: 11px; height: 11px; border-radius: 50%; border: 3px solid var(--idle); background: var(--panel); margin-right: 6px; vertical-align: -1px; }
 .legend .go i { border-color: var(--go); } .legend .wait i { border-color: var(--wait); } .legend .stopped i { border-color: var(--stop); background: var(--stop); }
 
-details { border-top: 1px solid var(--rule); padding-top: 16px; }
-summary { cursor: pointer; font: 700 17px var(--round); width: fit-content; }
-.tablewrap { overflow-x: auto; margin-top: 16px; }
+.line { --c: #2455d8; background: var(--panel); border: 1px solid var(--rule); border-radius: 14px; padding: 20px 26px 22px; margin-bottom: 12px; }
+.line.blocked { border-color: var(--stop); }
+.line header { display: flex; align-items: center; gap: 14px; flex-wrap: wrap; margin-bottom: 20px; }
+.badge { background: var(--c); color: #fff; font-weight: 700; font-size: 15px; letter-spacing: .01em; padding: 4px 12px; border-radius: 8px; }
+.line header .info { color: var(--soft); font-size: 14px; }
+.line header .info b { color: var(--ink); font-weight: 600; }
+.line header .count { margin-left: auto; color: var(--soft); font-size: 14px; font-variant-numeric: tabular-nums; }
+.stops { list-style: none; margin: 0; padding: 0; display: flex; position: relative; }
+.stop { position: relative; flex: 1 1 0; min-width: 0; padding: 36px 12px 0 0; }
+.stop::before { content: ""; position: absolute; top: 13px; left: 0; right: 0; height: 6px; background: var(--c); }
+.stop:first-child::before { left: 13px; }
+.stop:last-child::before { right: calc(100% - 13px); }
+.stop:only-child::before { display: none; }
+.dot { position: absolute; top: 3px; left: 3px; width: 26px; height: 26px; border-radius: 50%; background: var(--panel); border: 6px solid var(--idle); z-index: 1; }
+.go .dot { border-color: var(--go); } .wait .dot { border-color: var(--wait); } .stopped .dot { border-color: var(--stop); background: var(--stop); }
+.head .dot { border-color: var(--go); background: var(--go); }
+.arrive .dot { animation: arrive .7s ease-out; }
+@keyframes arrive { from { box-shadow: 0 0 0 0 color-mix(in srgb, var(--go) 60%, transparent); } to { box-shadow: 0 0 0 14px transparent; } }
+.who { display: block; font-size: 12px; color: var(--faint); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.what { display: block; font-weight: 600; font-size: 15px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.how { display: block; font-size: 13px; margin-top: 2px; color: var(--faint); font-variant-numeric: tabular-nums; }
+.go .how { color: var(--go); } .wait .how { color: var(--wait); } .stopped .how { color: var(--stop); }
+.train { position: absolute; top: 9px; left: 3px; width: 26px; height: 14px; border-radius: 7px; background: var(--c); border: 2px solid var(--panel);
+  z-index: 2; pointer-events: none; }
+
+.connect { margin-top: 48px; display: grid; grid-template-columns: 1fr auto; gap: 18px 24px; align-items: center; background: var(--ink); color: var(--paper);
+  border-radius: 14px; padding: 24px 26px; }
+.connect h3 { margin: 0 0 4px; font-size: 18px; }
+.connect p { margin: 0; color: color-mix(in srgb, var(--paper) 72%, transparent); font-size: 15px; }
+.connect .code { background: transparent; color: var(--paper); border-color: color-mix(in srgb, var(--paper) 30%, transparent); }
+.connect button { background: var(--paper); color: var(--ink); border: 0; border-radius: 9px; padding: 11px 18px; font-weight: 700; }
+
+details { margin-top: 40px; border-top: 1px solid var(--rule); padding-top: 18px; }
+summary { cursor: pointer; font-weight: 700; font-size: 16px; width: fit-content; }
+.tablewrap { overflow-x: auto; margin-top: 14px; }
 table { width: 100%; border-collapse: collapse; font-size: 14px; font-variant-numeric: tabular-nums; }
-th, td { text-align: left; padding: 9px 14px 9px 0; border-bottom: 1px solid var(--rule); white-space: nowrap; }
+th, td { text-align: left; padding: 9px 16px 9px 0; border-bottom: 1px solid var(--rule); white-space: nowrap; }
 th { color: var(--soft); font-weight: 600; }
+td:first-child { font-family: var(--mono); font-size: 13px; }
 .num { text-align: right; }
 
-.gate { max-width: 520px; }
-.gate form { display: flex; gap: 10px; flex-wrap: wrap; margin-top: 24px; }
+.gate { max-width: 540px; }
+.gate h1 { font-size: clamp(30px, 5vw, 46px); line-height: 1.08; letter-spacing: -.03em; margin: 0 0 12px; }
+.gate p { color: var(--soft); margin: 0; }
+.gate form { display: flex; gap: 10px; flex-wrap: wrap; margin-top: 26px; }
 .gate input { flex: 1 1 240px; font: inherit; padding: 12px 14px; border-radius: 10px; border: 1px solid var(--rule); background: var(--panel); color: var(--ink); }
-.gate button { font: 700 16px var(--round); padding: 12px 22px; border: 0; border-radius: 10px; background: var(--ink); color: var(--paper); cursor: pointer; }
+.gate button { font-weight: 700; padding: 12px 22px; border: 0; border-radius: 10px; background: var(--ink); color: var(--paper); }
 .gate .msg { color: var(--stop); width: 100%; margin: 0; min-height: 1.5em; }
 
-@media (max-width: 640px) {
-  main { padding: 20px 16px 48px; }
-  .top { margin-bottom: 32px; }
-  .numbers div { flex-basis: 45%; }
-  .numbers div + div { padding-left: 0; border-left: 0; }
-  .numbers div:nth-child(even) { padding-left: 16px; border-left: 1px solid var(--rule); }
+@media (max-width: 700px) {
+  main { padding: 0 16px 48px; }
+  .top { margin-bottom: 36px; }
+  .hero { column-gap: 14px; }
+  .signal { width: 16px; height: 16px; }
+  .numbers { grid-template-columns: 1fr 1fr; }
+  .numbers div + div { border-left: 0; }
+  .numbers div:nth-child(even) { border-left: 1px solid var(--rule); }
+  .numbers div:nth-child(n+3) { border-top: 1px solid var(--rule); }
+  .line { padding: 18px 18px 8px; }
+  .line header .count { margin-left: 0; width: 100%; }
   .stops { flex-direction: column; }
-  .stop { flex: none; padding: 0 0 16px 40px; min-height: 44px; }
-  .stop::before { top: 0; bottom: 0; left: 11px; right: auto; width: 6px; height: auto; }
-  .stop:first-child::before { left: 11px; top: 12px; }
-  .stop:last-child::before { right: auto; bottom: calc(100% - 14px); }
-  .dot { top: 1px; left: 2px; }
+  .stop { flex: none; padding: 0 0 18px 44px; min-height: 48px; }
+  .stop::before { top: 0; bottom: 0; left: 13px; right: auto; width: 6px; height: auto; }
+  .stop:first-child::before { top: 13px; left: 13px; }
+  .stop:last-child::before { right: auto; bottom: calc(100% - 16px); }
+  .train { top: 3px; left: 9px; width: 14px; height: 26px; }
+  .connect { grid-template-columns: 1fr; }
 }
-@media (prefers-reduced-motion: reduce) { .head .dot { animation: none; } }
+@media (prefers-reduced-motion: reduce) { .train { display: none; } .arrive .dot { animation: none; } }
 [hidden] { display: none !important; }
 `;
 const DASHBOARD_JS = `
 const T = {
   en: {
-    live: 'live', offline: 'not answering', up: 'running for ',
-    allGood: 'All good.', detours: 'All good, with detours.', idleTitle: 'Ready.', blocked: (n) => n + ' blocked.', down: 'Bascule is not answering.',
-    idleText: (u) => 'Waiting for the first request. Point your app at <span class="code">' + u + '</span> and use the model <span class="code">auto</span>.',
-    summary: (up, ok, fb) => 'In the last ' + up + ': <strong>' + ok + ' requests answered</strong>' + (fb ? ', <strong>' + fb + '</strong> of them rescued by switching to another model.' : '.'),
-    detourText: (n) => ' ' + n + (n > 1 ? ' models are' : ' model is') + ' taking a break; requests go to the next ones.',
-    blockedText: ' Every model on this line is paused or failing: requests there will fail until one comes back.',
-    downText: 'Start it again with the command <span class="code">bascule</span>. This page reconnects by itself.',
-    answered: 'answered', switched: 'switched model', failed: 'failed', words: 'words read', written: 'words written', cached: 'from memory',
-    linesTitle: 'Your lines', linesLead: 'A request starts on the left and stops at the first open station. If that one is busy or broken, it simply rolls on to the next.',
-    now: 'goes to', blockedLine: 'no station open',
-    go: 'open', wait: (s) => 'back in ' + s, stopped: 'not working', idle: 'not used yet',
-    lgo: 'open: answers requests', lwait: 'taking a break (limit reached), comes back alone', lstopped: 'not working (check the key)', lidle: 'not used yet',
-    details: 'Technical details', model: 'Model and key', state: 'State', ok: 'Answered', err: 'Errors', latency: 'Speed', limit: 'Limit', cannot: 'Cannot',
+    live: 'Live', offline: 'Not answering', up: 'up ',
+    good: 'Good service on all lines.', delays: 'Minor delays.', idleTitle: 'Ready for the first request.',
+    suspended: (n) => 'Service suspended on ' + n + '.', down: 'Bascule is not answering.',
+    idleText: 'Nothing has gone through yet. Connect an application with the address below and the lines will light up.',
+    summary: (up, ok, fb) => 'In the last ' + up + ', <strong>' + ok + (ok === '1' ? ' request' : ' requests') + ' answered</strong>' + (fb !== '0' ? ', of which <strong>' + fb + '</strong> reached their answer by switching model.' : '.'),
+    detourText: (n) => ' ' + n + (n > 1 ? ' stations are' : ' station is') + ' paused, so requests are rerouted to the next open one.',
+    blockedText: ' Every station on this line is paused or down, so its requests fail until one reopens.',
+    downText: 'Start it again with the command <span class="code">bascule</span>. This page reconnects on its own.',
+    answered: 'Requests answered', switched: 'Rerouted', failed: 'Failed', words: 'Words read', written: 'Words written', cached: 'Answered from memory',
+    linesTitle: 'Lines', linesLead: 'A request stops at the first open station. If it is busy or down, the request continues to the next one.',
+    now: 'Now serving', blockedLine: 'No open station', served: (n) => n + ' answered',
+    go: 'Open', wait: (s) => 'Back in ' + s, stopped: 'Down', idle: 'Not used yet',
+    lgo: 'Open', lwait: 'Paused, reopens on its own', lstopped: 'Down, check the key', lidle: 'Not used yet',
+    connectTitle: 'Connect an application', connectText: (u) => 'Use <span class="code">' + u + '</span> as the OpenAI address, your access key as the API key, and <span class="code">auto</span> as the model.',
+    copy: 'Copy address', copied: 'Address copied',
+    details: 'Technical details', model: 'Model and key', state: 'State', ok: 'Answered', err: 'Errors', latency: 'Response time', limit: 'Limit', cannot: 'Cannot handle',
     perMin: '/min', vision: 'images', tools: 'tools',
-    gateTitle: 'This page is locked.', gateText: 'Paste your access key. It is the BASCULE_KEY line in ~/.bascule/.env, or run bascule dashboard to open this page already unlocked.',
-    open: 'Unlock', badKey: 'That key does not match. Check the BASCULE_KEY line again.', placeholder: 'access key' },
+    gateTitle: 'This dashboard is locked.', gateText: 'Paste your access key: the BASCULE_KEY line in ~/.bascule/.env. The command bascule dashboard opens it already unlocked.',
+    open: 'Unlock', badKey: 'This key does not match BASCULE_KEY.', placeholder: 'Access key' },
   fr: {
-    live: 'en direct', offline: 'ne répond pas', up: 'actif depuis ',
-    allGood: 'Tout roule.', detours: 'Tout roule, avec des détours.', idleTitle: 'Prêt.', blocked: (n) => n + ' à l’arrêt.', down: 'Bascule ne répond pas.',
-    idleText: (u) => 'En attente de la première demande. Règle ton application sur <span class="code">' + u + '</span> avec le modèle <span class="code">auto</span>.',
-    summary: (up, ok, fb) => 'Depuis ' + up + ' : <strong>' + ok + ' demandes servies</strong>' + (fb ? ', dont <strong>' + fb + '</strong> sauvées en changeant de modèle.' : '.'),
-    detourText: (n) => ' ' + n + (n > 1 ? ' modèles font' : ' modèle fait') + ' une pause ; les demandes passent par les suivants.',
-    blockedText: ' Tous les modèles de cette ligne sont en pause ou en panne : les demandes y échouent jusqu’au retour de l’un d’eux.',
+    live: 'En direct', offline: 'Ne répond pas', up: 'actif depuis ',
+    good: 'Trafic normal sur toutes les lignes.', delays: 'Trafic perturbé.', idleTitle: 'Prêt pour la première demande.',
+    suspended: (n) => 'Trafic interrompu sur ' + n + '.', down: 'Bascule ne répond pas.',
+    idleText: 'Aucune demande pour l’instant. Branche une application avec l’adresse ci-dessous et les lignes s’allumeront.',
+    summary: (up, ok, fb) => 'Depuis ' + up + ', <strong>' + ok + (ok === '1' ? ' demande servie' : ' demandes servies') + '</strong>' + (fb !== '0' ? ', dont <strong>' + fb + '</strong> arrivées à destination grâce à un changement de modèle.' : '.'),
+    detourText: (n) => ' ' + n + (n > 1 ? ' stations sont en pause' : ' station est en pause') + ' : les demandes sont déviées vers la suivante ouverte.',
+    blockedText: ' Toutes les stations de cette ligne sont en pause ou en panne : ses demandes échouent jusqu’à la réouverture de l’une d’elles.',
     downText: 'Relance-le avec la commande <span class="code">bascule</span>. Cette page se reconnecte toute seule.',
-    answered: 'demandes servies', switched: 'changements de modèle', failed: 'échecs', words: 'mots lus', written: 'mots écrits', cached: 'réponses en mémoire',
-    linesTitle: 'Tes lignes', linesLead: 'Une demande part de la gauche et s’arrête à la première station ouverte. Si elle est occupée ou en panne, la demande continue simplement vers la suivante.',
-    now: 'va vers', blockedLine: 'aucune station ouverte',
-    go: 'ouvert', wait: (s) => 'retour dans ' + s, stopped: 'en panne', idle: 'pas encore utilisé',
-    lgo: 'ouvert : répond aux demandes', lwait: 'en pause (limite atteinte), revient tout seul', lstopped: 'en panne (vérifie la clé)', lidle: 'pas encore utilisé',
-    details: 'Détails techniques', model: 'Modèle et clé', state: 'État', ok: 'Servies', err: 'Erreurs', latency: 'Vitesse', limit: 'Limite', cannot: 'Ne sait pas',
+    answered: 'Demandes servies', switched: 'Déviées', failed: 'Échecs', words: 'Mots lus', written: 'Mots écrits', cached: 'Servies depuis la mémoire',
+    linesTitle: 'Lignes', linesLead: 'Une demande s’arrête à la première station ouverte. Si elle est occupée ou en panne, la demande continue vers la suivante.',
+    now: 'Dessert', blockedLine: 'Aucune station ouverte', served: (n) => n + (n === '1' ? ' servie' : ' servies'),
+    go: 'Ouverte', wait: (s) => 'Retour dans ' + s, stopped: 'En panne', idle: 'Pas encore utilisée',
+    lgo: 'Ouverte', lwait: 'En pause, rouvre toute seule', lstopped: 'En panne, vérifier la clé', lidle: 'Pas encore utilisée',
+    connectTitle: 'Brancher une application', connectText: (u) => 'Adresse OpenAI <span class="code">' + u + '</span>, ta clé d’accès comme clé API, et le modèle <span class="code">auto</span>.',
+    copy: 'Copier l’adresse', copied: 'Adresse copiée',
+    details: 'Détails techniques', model: 'Modèle et clé', state: 'État', ok: 'Servies', err: 'Erreurs', latency: 'Temps de réponse', limit: 'Limite', cannot: 'Ne gère pas',
     perMin: '/min', vision: 'images', tools: 'outils',
-    gateTitle: 'Cette page est verrouillée.', gateText: 'Colle ta clé d’accès. C’est la ligne BASCULE_KEY dans ~/.bascule/.env. Ou lance bascule dashboard pour ouvrir cette page déjà déverrouillée.',
-    open: 'Déverrouiller', badKey: 'Cette clé ne correspond pas. Vérifie la ligne BASCULE_KEY.', placeholder: 'clé d’accès' },
+    gateTitle: 'Ce tableau de bord est verrouillé.', gateText: 'Colle ta clé d’accès : la ligne BASCULE_KEY dans ~/.bascule/.env. La commande bascule dashboard l’ouvre déjà déverrouillé.',
+    open: 'Déverrouiller', badKey: 'Cette clé ne correspond pas à BASCULE_KEY.', placeholder: 'Clé d’accès' },
 };
 const lang = (navigator.language || 'en').slice(0, 2);
 const L = T[lang] || T.en;
@@ -1290,6 +1329,8 @@ const fmt = (n) => Math.round(Number(n || 0)).toLocaleString(lang);
 const dur = (s) => s >= 86400 ? Math.floor(s / 86400) + (lang === 'fr' ? ' j ' : ' d ') + Math.floor(s % 86400 / 3600) + ' h'
   : s >= 3600 ? Math.floor(s / 3600) + ' h ' + Math.floor(s % 3600 / 60) + ' min' : s >= 60 ? Math.floor(s / 60) + ' min' : s + ' s';
 const endpoint = location.origin + '/v1';
+const still = matchMedia('(prefers-reduced-motion: reduce)');
+const LINE_COLORS = ['#2455d8', '#7a3fc4', '#0b7f8a', '#b8406f', '#8a5a1f', '#3b5b86'];
 
 let key = localStorage.getItem('bascule-key') || '';
 function keyFromHash() {
@@ -1304,6 +1345,10 @@ $('keyinput').placeholder = L.placeholder;
 $('keyform').addEventListener('submit', (e) => { e.preventDefault(); key = $('keyinput').value.trim(); localStorage.setItem('bascule-key', key); $('keyinput').value = ''; poll(); });
 $('lines-title').textContent = L.linesTitle; $('lines-lead').textContent = L.linesLead; $('details-title').textContent = L.details;
 $('legend').replaceChildren(...[['go', L.lgo], ['wait', L.lwait], ['stopped', L.lstopped], ['idle', L.lidle]].map(([c, t]) => el('li', c, el('i'), t)));
+$('connect-title').textContent = L.connectTitle; $('connect-text').innerHTML = L.connectText(esc(endpoint)); $('copy').textContent = L.copy;
+$('copy').addEventListener('click', async () => {
+  try { await navigator.clipboard.writeText(endpoint); $('copy').textContent = L.copied; setTimeout(() => { $('copy').textContent = L.copy; }, 1800); } catch {}
+});
 
 function stateOf(t) {
   if (!t) return 'idle';
@@ -1311,7 +1356,7 @@ function stateOf(t) {
   if (!t.ok && !t.err) return 'idle';
   return t.ok ? 'go' : 'stopped';
 }
-// Several keys per model: the model is open while one key is.
+// Several keys per model: the station is open while one key is.
 function station(st, id) {
   const ks = Object.entries(st.targets).filter(([hid]) => hid.startsWith(id + '#')).map(([, t]) => t);
   if (!ks.length) return { s: 'idle' };
@@ -1322,42 +1367,103 @@ function station(st, id) {
 const say = (s, t) => s === 'wait' ? L.wait(dur(t.coolingForS)) : L[s];
 const split = (id) => { const i = id.indexOf('/'); return [id.slice(0, i), id.slice(i + 1)]; };
 
+// Numbers glide to their new value instead of jumping.
+function count(node, to) {
+  const from = Number(node.dataset.v || 0);
+  node.dataset.v = to;
+  if (still.matches || from === to || !node.isConnected) { node.textContent = fmt(to); return; }
+  const t0 = performance.now();
+  const step = (now) => {
+    const k = Math.min(1, (now - t0) / 600), e = 1 - (1 - k) ** 3;
+    node.textContent = fmt(from + (to - from) * e);
+    if (k < 1 && node.dataset.v == to) requestAnimationFrame(step);
+  };
+  requestAnimationFrame(step);
+}
+
+// Lines are built once per shape and then updated in place, so running trains are not cut.
+let shape = '', built = {}, lastServed = null;
+function buildLines(st) {
+  built = {};
+  $('lines').replaceChildren(...Object.entries(st.combos || {}).map(([name, ids], i) => {
+    const info = el('span', 'info'), cnt = el('span', 'count');
+    const stops = ids.map((id) => {
+      const [who, what] = split(id), how = el('span', 'how');
+      const li = el('li', 'stop', el('span', 'dot'), el('span', 'who', who), el('span', 'what', what), how);
+      li.title = id;
+      return { id, li, how };
+    });
+    const ol = el('ol', 'stops', ...stops.map((x) => x.li));
+    const sec = el('section', 'line', el('header', '', el('span', 'badge', name), info, cnt), ol);
+    sec.style.setProperty('--c', LINE_COLORS[i % LINE_COLORS.length]);
+    built[name] = { sec, info, cnt, ol, stops };
+    return sec;
+  }));
+}
+function train(line, stop) {
+  stop.li.classList.remove('arrive');
+  if (still.matches) return;
+  const box = line.ol.getBoundingClientRect(), a = line.stops[0].li.querySelector('.dot').getBoundingClientRect(), b = stop.li.querySelector('.dot').getBoundingClientRect();
+  const dx = b.left - a.left, dy = b.top - a.top;
+  const car = el('span', 'train');
+  line.ol.append(car);
+  const ms = 450 + Math.hypot(dx, dy) * 0.9;
+  car.animate([{ transform: 'translate(0,0)', opacity: 0 }, { opacity: 1, offset: 0.08 }, { transform: 'translate(' + dx + 'px,' + dy + 'px)', opacity: 1, offset: 0.92 },
+    { transform: 'translate(' + dx + 'px,' + dy + 'px)', opacity: 0 }], { duration: ms, easing: 'cubic-bezier(.45,0,.25,1)' })
+    .finished.then(() => { car.remove(); void stop.li.offsetWidth; stop.li.classList.add('arrive'); }, () => car.remove());
+}
+
 function render(st) {
   $('meta').replaceChildren(el('span', 'pulse'), L.live + ' · ' + L.up + dur(st.uptimeS) + ' · v' + st.version);
-  const lines = Object.entries(st.combos || {}).map(([name, ids]) => {
-    const stops = ids.map((id) => ({ id, ...station(st, id) }));
-    return { name, stops, head: stops.find((x) => x.s === 'go' || x.s === 'idle') };
-  });
-  const paused = new Set(lines.flatMap((l) => l.stops.filter((x) => x.s === 'wait' || x.s === 'stopped').map((x) => x.id))).size;
-  const blocked = lines.filter((l) => l.stops.length && !l.head);
-  const answered = st.requests - st.failures;
+  const sig = JSON.stringify(st.combos || {});
+  if (sig !== shape) { shape = sig; buildLines(st); }
 
-  let title, text;
-  if (blocked.length) { title = L.blocked(blocked.map((l) => l.name).join(', ')); text = L.blockedText; }
-  else if (!st.requests) { title = L.idleTitle; text = L.idleText(esc(endpoint)); }
-  else if (paused) { title = L.detours; text = L.summary(dur(st.uptimeS), fmt(answered), st.fallbacks && fmt(st.fallbacks)) + L.detourText(paused); }
-  else { title = L.allGood; text = L.summary(dur(st.uptimeS), fmt(answered), st.fallbacks && fmt(st.fallbacks)); }
-  if (blocked.length && st.requests) text = L.summary(dur(st.uptimeS), fmt(answered), st.fallbacks && fmt(st.fallbacks)) + text;
+  let paused = new Set(), blocked = [];
+  for (const [name, line] of Object.entries(built)) {
+    let head = null;
+    for (const x of line.stops) {
+      const { s, t } = station(st, x.id);
+      if (!head && (s === 'go' || s === 'idle')) head = x;
+      if (s === 'wait' || s === 'stopped') paused.add(x.id);
+      x.li.classList.remove('go', 'wait', 'stopped', 'idle', 'head');
+      x.li.classList.add(s);
+      x.how.textContent = say(s, t);
+    }
+    if (head && station(st, head.id).s === 'go') head.li.classList.add('head');
+    line.sec.classList.toggle('blocked', !head && line.stops.length > 0);
+    if (!head && line.stops.length) blocked.push(name);
+    const [who, what] = head ? split(head.id) : [];
+    line.info.replaceChildren(...(head ? [L.now + ' ', el('b', '', what), ' · ' + who] : [L.blockedLine]));
+    const n = Object.values(st.served?.[name] || {}).reduce((a, b) => a + b, 0);
+    line.cnt.textContent = n ? L.served(fmt(n)) : '';
+    // A few trains at most per refresh, spaced out, for the answers since the last one.
+    if (lastServed) {
+      let delay = 0;
+      for (const x of line.stops) {
+        const fresh = Math.min(3, (st.served?.[name]?.[x.id] || 0) - (lastServed[name]?.[x.id] || 0));
+        for (let k = 0; k < fresh; k++, delay += 380) setTimeout(() => train(line, x), delay);
+      }
+    }
+  }
+  lastServed = JSON.parse(JSON.stringify(st.served || {}));
+
+  const answered = st.requests - st.failures, sum = L.summary(dur(st.uptimeS), fmt(answered), fmt(st.fallbacks));
+  let title, text, level;
+  if (blocked.length) { level = 'bad'; title = L.suspended(blocked.join(', ')); text = (st.requests ? sum : '') + L.blockedText; }
+  else if (!st.requests) { level = 'idle'; title = L.idleTitle; text = L.idleText; }
+  else if (paused.size) { level = 'warn'; title = L.delays; text = sum + L.detourText(paused.size); }
+  else { level = 'ok'; title = L.good; text = sum; }
+  $('signal').className = 'signal ' + level;
   $('title').textContent = title; $('text').innerHTML = text;
 
   // About 0.75 English words per token: close enough to give a feel for the volume.
-  const nums = [[answered, L.answered], [st.fallbacks, L.switched], [st.failures, L.failed, st.failures > 0],
-    [st.tokens.prompt * 0.75, L.words], [st.tokens.completion * 0.75, L.written]];
-  if (st.cacheHits) nums.push([st.cacheHits, L.cached]);
-  $('numbers').replaceChildren(...nums.map(([n, label, bad]) => el('div', bad ? 'bad' : '', el('b', '', fmt(n)), el('span', '', label))));
-
-  $('lines').replaceChildren(...lines.map((l) => {
-    const head = l.head ? split(l.head.id).reverse().join(' · ') : null;
-    const sub = el('span');
-    if (head) sub.append(L.now + ' ', el('b', '', head)); else sub.append(L.blockedLine);
-    const ol = el('ol', 'stops', ...l.stops.map((x) => {
-      const [who, what] = split(x.id);
-      const li = el('li', 'stop ' + x.s + (x === l.head && x.s === 'go' ? ' head' : ''), el('span', 'dot'), el('span', 'who', who), el('span', 'what', what), el('span', 'how', say(x.s, x.t)));
-      li.title = x.id;
-      return li;
-    }));
-    return el('section', 'line' + (l.head ? '' : ' blocked'), el('header', '', el('strong', '', l.name), sub), ol);
-  }));
+  const nums = [['answered', answered], ['switched', st.fallbacks], ['failed', st.failures], ['words', st.tokens.prompt * 0.75],
+    ['written', st.tokens.completion * 0.75], ...(st.cacheHits ? [['cached', st.cacheHits]] : [])];
+  if ($('numbers').dataset.shape !== nums.map((n) => n[0]).join()) {
+    $('numbers').dataset.shape = nums.map((n) => n[0]).join();
+    $('numbers').replaceChildren(...nums.map(([k]) => { const d = el('div', '', el('b'), el('span', '', L[k])); d.id = 'n-' + k; return d; }));
+  }
+  for (const [k, v] of nums) { const d = $('n-' + k); d.classList.toggle('bad', k === 'failed' && v > 0); count(d.firstChild, Math.round(v)); }
 
   const rows = Object.entries(st.targets).sort(([a], [b]) => a.localeCompare(b));
   $('details').hidden = !rows.length;
@@ -1387,9 +1493,10 @@ async function poll() {
   } catch {
     show('app');
     $('meta').replaceChildren(el('span', 'pulse down'), L.offline);
-    $('title').textContent = L.down; $('text').innerHTML = L.downText;
+    $('signal').className = 'signal bad'; $('title').textContent = L.down; $('text').innerHTML = L.downText;
+    lastServed = null;
   }
-  poll.timer = setTimeout(poll, document.hidden ? 10000 : 2000);
+  poll.timer = setTimeout(poll, document.hidden ? 10000 : 1500);
 }
 document.addEventListener('visibilitychange', () => { if (!document.hidden) poll(); });
 poll();
@@ -1399,19 +1506,19 @@ const DASHBOARD = `<!doctype html>
 <title>bascule</title><style>${DASHBOARD_CSS}</style></head>
 <body><main>
 <div class="top">
-  <div class="brand"><svg viewBox="0 0 32 32" aria-hidden="true"><path d="M3 22h26" stroke="currentColor" stroke-width="4" stroke-linecap="round"/><path d="M10 22c5 0 8-12 19-12" fill="none" stroke="#1f9d55" stroke-width="4" stroke-linecap="round"/></svg>bascule</div>
+  <div class="brand"><svg viewBox="0 0 32 32" aria-hidden="true"><path d="M3 22h26" stroke="currentColor" stroke-width="4" stroke-linecap="round"/><path d="M9 22c6 0 8-12 20-12" fill="none" stroke="#2455d8" stroke-width="4" stroke-linecap="round"/><circle cx="9" cy="22" r="3.5" fill="#16874a"/></svg>bascule</div>
   <div class="meta" id="meta" aria-live="polite"></div>
 </div>
-<section id="gate" class="gate hero" hidden>
+<section id="gate" class="gate" hidden>
   <h1 id="gate-title"></h1><p id="gate-text"></p>
   <form id="keyform"><input id="keyinput" type="password" autocomplete="off" aria-labelledby="gate-text"><button id="open" type="submit"></button><p id="keymsg" class="msg" role="alert"></p></form>
 </section>
 <div id="app" hidden>
-  <section class="hero"><h1 id="title"></h1><p id="text"></p></section>
+  <section class="hero" aria-live="polite"><span id="signal" class="signal" aria-hidden="true"></span><h1 id="title"></h1><p id="text"></p></section>
   <div class="numbers" id="numbers"></div>
-  <h2 id="lines-title"></h2><p class="lead" id="lines-lead"></p>
+  <div class="section-head"><div><h2 id="lines-title"></h2><p class="lead" id="lines-lead"></p></div><ul class="legend" id="legend"></ul></div>
   <div id="lines"></div>
-  <ul class="legend" id="legend"></ul>
+  <section class="connect"><div><h3 id="connect-title"></h3><p id="connect-text"></p></div><button id="copy" type="button"></button></section>
   <details id="details"><summary id="details-title"></summary><div class="tablewrap"><table><thead id="thead"></thead><tbody id="tbody"></tbody></table></div></details>
 </div>
 </main><script>${DASHBOARD_JS}</script></body></html>`;
