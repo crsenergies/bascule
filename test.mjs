@@ -951,6 +951,17 @@ try {
     assert.deepEqual(out.combos.other, ['local/m']);
     assert.equal(JSON.parse(readFileSync(cfgPath + '.bak', 'utf8')).providers.cat.models.length, 2, 'backup of the previous config');
   });
+  await test('answered and rerouted count requests, not attempts; client errors are neither', async () => {
+    const before = await stats();
+    assert.equal((await post({ model: 'nope', messages: msg() })).status, 404);
+    const r = await post({ model: 'allfail', messages: msg('x') });
+    await r.text();
+    assert.equal((await post({ model: 'nohedge', messages: msg('direct') })).status, 200);
+    const st = await stats();
+    assert.equal(st.answered, before.answered + 1);
+    assert.equal(st.failures, before.failures + 1);
+    assert.equal(st.rerouted, before.rerouted);
+  });
   await test('SIGTERM stops the server within 5 s', async () => {
     const p2 = port + 1;
     const s2 = spawn(process.execPath, [SERVER], { cwd: dir, env: { ...env, BASCULE_PORT: String(p2) }, stdio: ['ignore', 'pipe', 'ignore'] });

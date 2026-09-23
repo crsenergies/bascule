@@ -733,7 +733,7 @@ function cacheSet(k, v) {
 }
 
 // ---------- stats ----------
-const stats = { requests: 0, cacheHits: 0, fallbacks: 0, hedges: 0, failures: 0, tokens: { prompt: 0, completion: 0 } };
+const stats = { requests: 0, answered: 0, rerouted: 0, cacheHits: 0, fallbacks: 0, hedges: 0, failures: 0, tokens: { prompt: 0, completion: 0 } };
 // Answers per combo and target: the dashboard animates each new one along its line.
 const served = {};
 // Per-minute activity for the last hour, for the dashboard chart.
@@ -743,6 +743,9 @@ function tally(kind, ms) {
   let b = timeline.at(-1);
   if (!b || b.m !== m) { timeline.push(b = { m, ok: 0, rerouted: 0, failed: 0, ms: 0, n: 0 }); if (timeline.length > 60) timeline.shift(); }
   b[kind]++;
+  // Requests, not attempts: one request that went through three fallbacks is one rerouted answer.
+  if (kind !== 'failed') stats.answered++;
+  if (kind === 'rerouted') stats.rerouted++;
   if (ms !== undefined) { b.ms += ms; b.n++; }
 }
 const addUsage = (u, t) => {
@@ -1180,7 +1183,8 @@ const rank = (a, b) => b.id.endsWith(':free') - a.id.endsWith(':free') || (b.sup
   || (b.context_length || 0) - (a.context_length || 0) || (b.created || 0) - (a.created || 0);
 
 async function listModelsOf(p, key) {
-  const url = p.type === 'anthropic' ? `${p.baseUrl}/v1/models` : `${p.baseUrl}/models`;
+  // Anthropic pages its list (20 by default): ask for all at once, or live models would look retired.
+  const url = p.type === 'anthropic' ? `${p.baseUrl}/v1/models?limit=1000` : `${p.baseUrl}/models`;
   const r = await fetch(url, { headers: key === undefined ? {} : authHeaders(p, key), signal: AbortSignal.timeout(10_000) });
   if (!r.ok) throw new Error(`HTTP ${r.status}`);
   const data = (await r.json()).data;
@@ -1202,7 +1206,14 @@ async function discover(apply) {
     }
     const ids = new Set(list.map((m) => m.id));
     const configured = raw.models || [];
-    const retired = configured.filter((m) => !ids.has(m));
+    let retired = configured.filter((m) => !ids.has(m));
+    // Only a list read with a key speaks for the account, and one that misses most models is more
+    // likely incomplete than a mass retirement: in both cases report, but never remove.
+    const trusted = Boolean(p) && retired.length <= configured.length / 2;
+    if (retired.length && !trusted) {
+      for (const m of retired) console.log(`       not listed: ${m}  (check it by hand)`);
+      retired = [];
+    }
     // Prices only mean something when the catalogue mixes free and paid models (OpenRouter). Groq or
     // Gemini list prices too, yet their whole catalogue is on the account's free tier.
     const free = list.filter(isFree).filter((m) => !NOT_CHAT.test(m.id)).sort(rank);
@@ -1253,7 +1264,7 @@ async function discover(apply) {
   const file = JSON.parse(text);
   const drop = new Set(Object.entries(found).flatMap(([n, f]) => f.retired.map((m) => `${n}/${m}`)));
   for (const [n, f] of Object.entries(found)) {
-    file.providers[n].models = file.providers[n].models.filter((m) => !f.retired.includes(m));
+    file.providers[n].models = (file.providers[n].models || []).filter((m) => !f.retired.includes(m));
   }
   for (const [name, c] of Object.entries(file.combos || {})) {
     const keep = (list) => list.filter((t) => !drop.has(t));
@@ -1271,8 +1282,13 @@ async function discover(apply) {
       }
     }
   }
-  writeFileSync(CONFIG_PATH + '.bak', text);
-  writeFileSync(CONFIG_PATH, JSON.stringify(file, null, 2) + '\n');
+  try {
+    writeFileSync(CONFIG_PATH + '.bak', text);
+    writeFileSync(CONFIG_PATH, JSON.stringify(file, null, 2) + '\n');
+  } catch (e) {
+    console.error(`\n  cannot write ${CONFIG_PATH}: ${e.code || e.message}. Run "bascule init" for a config of your own in ~/.bascule, then try again.`);
+    return false;
+  }
   console.log(`\n  updated ${CONFIG_PATH} (previous version in ${CONFIG_PATH}.bak)`);
   if (CONFIG_PATH === join(ROOT, 'config.json') && !localSetup) console.log('  note: this is the bundled config, replaced on update. Run "bascule init" to get your own in ~/.bascule');
   console.log('  a running bascule reloads it by itself');
@@ -1575,9 +1591,10 @@ const split = (id) => { const i = id.indexOf('/'); return [id.slice(0, i), id.sl
 
 // Numbers glide to their new value instead of jumping.
 function count(node, to) {
-  const from = Number(node.dataset.v || 0);
+  const first = node.dataset.v === undefined, from = Number(node.dataset.v || 0);
   node.dataset.v = to;
-  if (still.matches || from === to || !node.isConnected) { node.textContent = fmt(to); return; }
+  // The first value is shown as is: counting up from zero on load would misreport the totals.
+  if (first || still.matches || from === to || !node.isConnected) { node.textContent = fmt(to); return; }
   const t0 = performance.now();
   const step = (now) => {
     const k = Math.min(1, (now - t0) / 600), e = 1 - (1 - k) ** 3;
@@ -1653,11 +1670,11 @@ function render(st) {
   }
   lastServed = JSON.parse(JSON.stringify(st.served || {}));
 
-  const answered = st.requests - st.failures, sum = L.summary(dur(st.uptimeS), fmt(answered), fmt(st.fallbacks));
+  const answered = st.answered, done = st.answered + st.failures, sum = L.summary(dur(st.uptimeS), fmt(answered), fmt(st.rerouted));
   let title, text, level;
   if (st.cost?.capped && !blocked.length) { level = 'warn'; title = L.capTitle; text = L.capText(usd(st.cost.budgetUsd)); }
-  else if (blocked.length) { level = 'bad'; title = L.suspended(blocked.join(', ')); text = (st.requests ? sum : '') + L.blockedText; }
-  else if (!st.requests) { level = 'idle'; title = L.idleTitle; text = L.idleText; }
+  else if (blocked.length) { level = 'bad'; title = L.suspended(blocked.join(', ')); text = (done ? sum : '') + L.blockedText; }
+  else if (!done) { level = 'idle'; title = L.idleTitle; text = L.idleText; }
   else if (paused.size) { level = 'warn'; title = L.delays; text = sum + L.detourText(paused.size); }
   else { level = 'ok'; title = L.good; text = sum; }
   $('signal').className = 'signal ' + level;
@@ -1666,8 +1683,8 @@ function render(st) {
   const tl = st.timeline || [], timed = tl.filter((b) => b.latencyMs !== null);
   const w = timed.reduce((a, b) => a + b.ok + b.rerouted, 0);
   const avg = w ? Math.round(timed.reduce((a, b) => a + b.latencyMs * (b.ok + b.rerouted), 0) / w) : null;
-  const nums = [['availability', st.requests ? answered / st.requests * 100 : null, (v) => v === null ? '–' : (v >= 99.95 ? '100' : v.toLocaleString(lang, { maximumFractionDigits: 1 })) + ' %'],
-    ['answered', answered], ['switched', st.fallbacks], ['failed', st.failures],
+  const nums = [['availability', done ? answered / done * 100 : null, (v) => v === null ? '–' : (v >= 99.95 ? '100' : v.toLocaleString(lang, { maximumFractionDigits: 1 })) + ' %'],
+    ['answered', answered], ['switched', st.rerouted], ['failed', st.failures],
     ['speed', avg, (v) => v === null ? '–' : v < 1000 ? fmt(v) + ' ms' : (v / 1000).toLocaleString(lang, { maximumFractionDigits: 1 }) + ' s'],
     ['spent', st.cost?.usd || 0, usd], ...(st.cacheHits ? [['cached', st.cacheHits]] : [])];
   if ($('numbers').dataset.shape !== nums.map((n) => n[0]).join()) {
