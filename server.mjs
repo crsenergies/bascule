@@ -8,10 +8,23 @@ import { dirname, join } from 'node:path';
 import { homedir } from 'node:os';
 
 const ROOT = dirname(fileURLToPath(import.meta.url));
-const HOME_DIR = join(homedir(), '.bascule');
+const HOME_DIR = process.env.BASCULE_HOME || join(homedir(), '.bascule');
+const VERSION = JSON.parse(readFileSync(join(ROOT, 'package.json'), 'utf8')).version;
 
+// ---------- cli ----------
+const arg = process.argv[2];
+if (arg === '--version' || arg === '-v') { console.log(VERSION); process.exit(0); }
+if (arg === '--help' || arg === '-h') {
+  console.log(`bascule ${VERSION} — OpenAI-compatible AI router with automatic fallback
+
+  bascule init      create ~/.bascule/config.json and ~/.bascule/.env (random access key)
+  bascule           start the router (default http://127.0.0.1:20129/v1)
+
+Environment: BASCULE_KEY, BASCULE_PORT, BASCULE_HOST, BASCULE_CONFIG, BASCULE_HOME, BASCULE_LOG=0`);
+  process.exit(0);
+}
 // `bascule init`: per-user config in ~/.bascule, so a global npm install works.
-if (process.argv[2] === 'init') {
+if (arg === 'init') {
   mkdirSync(HOME_DIR, { recursive: true, mode: 0o700 });
   const cfgOut = join(HOME_DIR, 'config.json'), envOut = join(HOME_DIR, '.env');
   if (!existsSync(cfgOut)) copyFileSync(join(ROOT, 'config.json'), cfgOut);
@@ -22,19 +35,27 @@ if (process.argv[2] === 'init') {
   console.log(`config: ${cfgOut}\nkeys:   ${envOut}  (add your provider API keys, then run: bascule)`);
   process.exit(0);
 }
-
-// First existing file wins: explicit env var, current directory, ~/.bascule, bundled default.
-const firstExisting = (...paths) => paths.find((p) => p && existsSync(p));
+if (arg) { console.error(`unknown argument "${arg}" (try --help)`); process.exit(2); }
 
 // ---------- config ----------
 function loadEnvFile(path) {
-  if (!existsSync(path)) return;
-  for (const line of readFileSync(path, 'utf8').split('\n')) {
-    const m = line.match(/^\s*([A-Z0-9_]+)\s*=\s*(.*?)\s*$/);
-    if (m && process.env[m[1]] === undefined) process.env[m[1]] = m[2].replace(/^["']|["']$/g, '');
+  if (!path || !existsSync(path)) return;
+  for (const line of readFileSync(path, 'utf8').split(/\r?\n/)) {
+    const m = line.match(/^\s*(?:export\s+)?([A-Za-z0-9_]+)\s*=\s*(.*?)\s*$/);
+    if (!m || process.env[m[1]] !== undefined) continue;
+    let v = m[2];
+    if (/^(["']).*\1$/.test(v)) v = v.slice(1, -1);
+    else v = v.replace(/\s+#.*$/, ''); // inline comment on an unquoted value
+    process.env[m[1]] = v;
   }
 }
-loadEnvFile(firstExisting(join(process.cwd(), '.env'), join(HOME_DIR, '.env'), join(ROOT, '.env')) || '');
+
+// First existing path wins. A project-local setup needs ./bascule.json, so running bascule
+// inside an unrelated project never picks up that project's .env (and its PORT, keys...).
+const firstExisting = (...paths) => paths.find((p) => p && existsSync(p));
+const LOCAL_CFG = join(process.cwd(), 'bascule.json');
+const localSetup = existsSync(LOCAL_CFG);
+loadEnvFile(localSetup ? join(process.cwd(), '.env') : firstExisting(join(HOME_DIR, '.env'), join(ROOT, '.env')));
 
 const expand = (v) =>
   typeof v === 'string' ? v.replace(/\$\{(\w+)\}/g, (_, k) => process.env[k] ?? '')
@@ -42,13 +63,23 @@ const expand = (v) =>
   : v && typeof v === 'object' ? Object.fromEntries(Object.entries(v).map(([k, x]) => [k, expand(x)]))
   : v;
 
-const CONFIG_PATH = firstExisting(process.env.BASCULE_CONFIG, join(process.cwd(), 'bascule.json'),
+const CONFIG_PATH = firstExisting(process.env.BASCULE_CONFIG, localSetup && LOCAL_CFG,
   join(HOME_DIR, 'config.json'), join(ROOT, 'config.json'));
-const cfg = expand(JSON.parse(readFileSync(CONFIG_PATH, 'utf8')));
-const PORT = Number(process.env.PORT || cfg.port || 20129);
-const HOST = process.env.HOST || cfg.host || '127.0.0.1';
+let cfg;
+try { cfg = expand(JSON.parse(readFileSync(CONFIG_PATH, 'utf8'))); }
+catch (e) { console.error(`cannot read config ${CONFIG_PATH}: ${e.message}`); process.exit(1); }
+
+const PORT = Number(process.env.BASCULE_PORT || cfg.port || 20129);
+const HOST = process.env.BASCULE_HOST || cfg.host || '127.0.0.1';
 const API_KEY = process.env.BASCULE_KEY || cfg.apiKey || '';
 const CORS = [].concat(cfg.corsOrigins ?? []); // browser origins allowed to call; none by default
+const TIMEOUT = cfg.timeoutMs ?? 120_000;            // whole non-streaming call
+const FIRST_BYTE_TIMEOUT = cfg.firstByteTimeoutMs ?? 30_000;
+const IDLE_TIMEOUT = cfg.idleTimeoutMs ?? 60_000;    // max silence inside a stream
+const CACHE_MAX = cfg.cache?.maxEntries ?? 500;
+const CACHE_TTL = cfg.cache?.ttlMs ?? 10 * 60_000;
+const COMPACT = cfg.compactWhitespace ?? true;
+const LOG = process.env.BASCULE_LOG !== '0' && cfg.log !== false;
 
 // Exposing the router beyond this machine without a strong key would let anyone spend the owner's quotas.
 const LOOPBACK = ['127.0.0.1', '::1', 'localhost'].includes(HOST);
@@ -56,23 +87,20 @@ if (!LOOPBACK && (API_KEY.length < 16 || API_KEY === 'change-me')) {
   console.error(`refusing to listen on ${HOST}: set BASCULE_KEY to a random value of 16+ characters (bascule init makes one)`);
   process.exit(1);
 }
-const TIMEOUT = cfg.timeoutMs ?? 120_000;
-const FIRST_BYTE_TIMEOUT = cfg.firstByteTimeoutMs ?? 30_000;
-const CACHE_MAX = cfg.cache?.maxEntries ?? 500;
-const CACHE_TTL = cfg.cache?.ttlMs ?? 10 * 60_000;
-const COMPACT = cfg.compactWhitespace ?? true;
 
 // ---------- providers & targets ----------
-// Provider: { type: 'openai'|'anthropic', baseUrl, keys: [..], headers, models: [..] }
+// Provider: { type: 'openai'|'anthropic', baseUrl, keys: [..], headers, models: [..], streamUsage }
 const providers = {};
 for (const [name, p] of Object.entries(cfg.providers || {})) {
   const keys = [].concat(p.keys ?? p.key ?? []).filter(Boolean);
   if (p.requiresKey !== false && keys.length === 0) continue; // skip unconfigured providers
-  providers[name] = { name, type: p.type || 'openai', baseUrl: p.baseUrl.replace(/\/$/, ''),
-    keys: keys.length ? keys : [''], headers: p.headers || {}, models: p.models || [], rr: 0 };
+  if (!p.baseUrl) { console.error(`provider "${name}" has no baseUrl, ignored`); continue; }
+  providers[name] = { name, type: p.type || 'openai', baseUrl: p.baseUrl.replace(/\/+$/, ''),
+    keys: keys.length ? keys : [''], headers: p.headers || {}, models: p.models || [],
+    streamUsage: p.streamUsage !== false, rr: 0 };
 }
 
-// Health per "provider/model/keyIndex": cooldown + EWMA latency + failure streak.
+// Health per "provider/model#keyIndex": cooldown + EWMA latency + failure streak.
 const health = new Map();
 const h = (id) => health.get(id) ?? (health.set(id, { until: 0, fails: 0, lat: 0, ok: 0, err: 0 }), health.get(id));
 
@@ -88,30 +116,27 @@ function success(id, ms) {
   s.fails = 0; s.until = 0; s.ok++;
   s.lat = s.lat ? s.lat * 0.8 + ms * 0.2 : ms;
 }
+// Best measured latency across a target's keys; unmeasured targets sort last.
+const latency = (t) => Math.min(...t.provider.keys.map((_, k) => h(`${t.id}#${k}`).lat || 1e9));
 
-// Resolve requested model into ordered list of { provider, model }.
+// Resolve requested model into ordered list of { provider, model, id }.
 function resolve(model) {
-  const combo = cfg.combos?.[model];
-  let list;
-  if (combo) {
-    const targets = Array.isArray(combo) ? combo : combo.targets;
-    const strategy = Array.isArray(combo) ? 'priority' : combo.strategy || 'priority';
-    list = targets.map(parseTarget).filter(Boolean);
-    if (strategy === 'fastest') {
-      list.sort((a, b) => (h(a.id + '#0').lat || 1e9) - (h(b.id + '#0').lat || 1e9));
-    } else if (strategy === 'round-robin') {
-      const n = (combo._rr = ((combo._rr ?? -1) + 1) % list.length);
-      list = [...list.slice(n), ...list.slice(0, n)];
-    }
-  } else {
-    const t = parseTarget(model);
-    list = t ? [t] : [];
+  const combo = Object.hasOwn(cfg.combos || {}, model) ? cfg.combos[model] : null;
+  if (!combo) { const t = parseTarget(model); return t ? [t] : []; }
+  const targets = Array.isArray(combo) ? combo : combo.targets || [];
+  const strategy = Array.isArray(combo) ? 'priority' : combo.strategy || 'priority';
+  let list = targets.map(parseTarget).filter(Boolean);
+  if (strategy === 'fastest') list.sort((a, b) => latency(a) - latency(b));
+  else if (strategy === 'round-robin' && list.length) {
+    const n = (combo._rr = ((combo._rr ?? -1) + 1) % list.length);
+    list = [...list.slice(n), ...list.slice(0, n)];
   }
   return list;
 }
 function parseTarget(s) {
+  if (typeof s !== 'string' || !s) return null;
   const i = s.indexOf('/');
-  if (i > 0 && providers[s.slice(0, i)]) {
+  if (i > 0 && Object.hasOwn(providers, s.slice(0, i))) {
     return { provider: providers[s.slice(0, i)], model: s.slice(i + 1), id: s };
   }
   // Bare model name: first provider that lists it.
@@ -119,15 +144,15 @@ function parseTarget(s) {
   return p ? { provider: p, model: s, id: `${p.name}/${s}` } : null;
 }
 
-// Keys for a target, healthy first, rotated round-robin.
-function keysFor(t) {
-  const p = t.provider, n = p.keys.length, start = p.rr++ % n, now = Date.now();
-  const out = [];
-  for (let i = 0; i < n; i++) {
+// Keys for a target, rotated round-robin; cooling state is read when the pair is tried.
+// Health is tracked per endpoint: a model that cannot embed must not be benched for chat.
+function keysFor(t, endpoint) {
+  const p = t.provider, n = p.keys.length, start = p.rr++ % n;
+  const scope = endpoint === '/chat/completions' ? '' : `${endpoint.slice(1)}:`;
+  return Array.from({ length: n }, (_, i) => {
     const k = (start + i) % n;
-    out.push({ key: p.keys[k], hid: `${t.id}#${k}`, cool: h(`${t.id}#${k}`).until > now });
-  }
-  return out.sort((a, b) => a.cool - b.cool);
+    return { key: p.keys[k], hid: `${scope}${t.id}#${k}` };
+  });
 }
 
 // ---------- request shaping ----------
@@ -135,8 +160,9 @@ function compact(body) {
   if (!COMPACT || !Array.isArray(body.messages)) return body;
   const squeeze = (s) => s.replace(/[ \t]+\n/g, '\n').replace(/\n{3,}/g, '\n\n').replace(/[ \t]{2,}/g, ' ');
   for (const m of body.messages) {
+    if (!m || typeof m !== 'object') continue;
     if (typeof m.content === 'string') m.content = squeeze(m.content);
-    else if (Array.isArray(m.content)) for (const c of m.content) if (c.type === 'text' && c.text) c.text = squeeze(c.text);
+    else if (Array.isArray(m.content)) for (const c of m.content) if (c?.type === 'text' && typeof c.text === 'string') c.text = squeeze(c.text);
   }
   return body;
 }
@@ -144,16 +170,23 @@ function compact(body) {
 // OpenAI -> Anthropic request
 function toAnthropic(body, model) {
   const system = [], messages = [];
-  const text = (c) => (typeof c === 'string' ? c : (c || []).filter((x) => x.type === 'text').map((x) => x.text).join('\n'));
+  const text = (c) => (typeof c === 'string' ? c : (c || []).filter((x) => x?.type === 'text').map((x) => x.text).join('\n'));
   const parts = (c) => {
     if (typeof c === 'string') return [{ type: 'text', text: c }];
     return (c || []).map((x) => {
-      if (x.type !== 'image_url') return { type: 'text', text: x.text ?? '' };
-      const url = x.image_url?.url || '';
-      const m = url.match(/^data:([^;]+);base64,(.*)$/);
-      return m ? { type: 'image', source: { type: 'base64', media_type: m[1], data: m[2] } }
-               : { type: 'image', source: { type: 'url', url } };
+      if (x?.type === 'image_url') {
+        const url = x.image_url?.url || '';
+        const m = url.match(/^data:([^;]+);base64,(.*)$/s);
+        return m ? { type: 'image', source: { type: 'base64', media_type: m[1], data: m[2] } }
+                 : { type: 'image', source: { type: 'url', url } };
+      }
+      return { type: 'text', text: x?.text ?? '' };
     });
+  };
+  // Anthropic rejects empty text blocks and empty messages.
+  const clean = (blocks) => {
+    const out = blocks.filter((b) => b.type !== 'text' || b.text.trim());
+    return out.length ? out : [{ type: 'text', text: '.' }];
   };
   const push = (role, blocks) => {
     const last = messages[messages.length - 1];
@@ -163,11 +196,11 @@ function toAnthropic(body, model) {
   for (const m of body.messages || []) {
     if (m.role === 'system' || m.role === 'developer') { system.push(text(m.content)); continue; }
     if (m.role === 'tool') {
-      push('user', [{ type: 'tool_result', tool_use_id: m.tool_call_id, content: text(m.content) }]);
+      push('user', [{ type: 'tool_result', tool_use_id: m.tool_call_id, content: text(m.content) || '(empty)' }]);
       continue;
     }
     if (m.role === 'assistant') {
-      const blocks = m.content ? parts(m.content).filter((b) => b.type !== 'text' || b.text) : [];
+      const blocks = m.content ? parts(m.content).filter((b) => b.type !== 'text' || b.text.trim()) : [];
       for (const tc of m.tool_calls || []) {
         let input = {};
         try { input = JSON.parse(tc.function.arguments || '{}'); } catch {}
@@ -176,14 +209,17 @@ function toAnthropic(body, model) {
       if (blocks.length) push('assistant', blocks);
       continue;
     }
-    push('user', parts(m.content));
+    push('user', clean(parts(m.content)));
   }
+  if (messages[0]?.role === 'assistant') messages.unshift({ role: 'user', content: [{ type: 'text', text: '.' }] });
   const out = { model, messages, max_tokens: body.max_completion_tokens || body.max_tokens || 4096 };
   if (system.length) out.system = system.join('\n\n');
-  for (const k of ['temperature', 'top_p', 'stream']) if (body[k] !== undefined) out[k] = body[k];
+  // OpenAI temperature goes up to 2, Anthropic's stops at 1.
+  if (typeof body.temperature === 'number') out.temperature = Math.min(Math.max(body.temperature, 0), 1);
+  for (const k of ['top_p', 'stream']) if (body[k] !== undefined) out[k] = body[k];
   if (body.stop) out.stop_sequences = [].concat(body.stop);
   if (body.tools?.length) {
-    out.tools = body.tools.map((t) => ({ name: t.function.name, description: t.function.description,
+    out.tools = body.tools.filter((t) => t.function).map((t) => ({ name: t.function.name, description: t.function.description,
       input_schema: t.function.parameters || { type: 'object', properties: {} } }));
     const tc = body.tool_choice;
     if (tc === 'required') out.tool_choice = { type: 'any' };
@@ -193,7 +229,7 @@ function toAnthropic(body, model) {
   return out;
 }
 
-const STOP = { end_turn: 'stop', stop_sequence: 'stop', max_tokens: 'length', tool_use: 'tool_calls' };
+const STOP = { end_turn: 'stop', stop_sequence: 'stop', max_tokens: 'length', tool_use: 'tool_calls', refusal: 'content_filter' };
 
 // Anthropic -> OpenAI response
 function fromAnthropic(r, model) {
@@ -214,17 +250,19 @@ function fromAnthropic(r, model) {
 }
 
 // Anthropic SSE -> OpenAI SSE, as async generator of strings.
-async function* anthropicStream(reader, model) {
-  const id = 'chatcmpl-' + Date.now().toString(36), created = Math.floor(Date.now() / 1000);
+async function* anthropicStream(reader, model, onUsage) {
+  const id = 'chatcmpl-' + randomBytes(8).toString('hex'), created = Math.floor(Date.now() / 1000);
   const chunk = (delta, finish = null, extra) =>
     `data: ${JSON.stringify({ id, object: 'chat.completion.chunk', created, model,
       choices: [{ index: 0, delta, finish_reason: finish }], ...extra })}\n\n`;
   const toolIdx = new Map(); // anthropic block index -> openai tool index
-  let inTok = 0;
-  yield chunk({ role: 'assistant', content: '' });
+  let inTok = 0, started = false;
   for await (const ev of sseEvents(reader)) {
     let d;
     try { d = JSON.parse(ev); } catch { continue; }
+    if (d.type === 'error') throw new Upstream(502, d.error?.message || 'upstream stream error');
+    // Nothing is sent before the upstream proves healthy, so an early error can still fall back.
+    if (!started) { started = true; yield chunk({ role: 'assistant', content: '' }); }
     if (d.type === 'message_start') inTok = d.message?.usage?.input_tokens || 0;
     else if (d.type === 'content_block_start' && d.content_block?.type === 'tool_use') {
       const i = toolIdx.size;
@@ -233,16 +271,16 @@ async function* anthropicStream(reader, model) {
         function: { name: d.content_block.name, arguments: '' } }] });
     } else if (d.type === 'content_block_delta') {
       if (d.delta.type === 'text_delta') yield chunk({ content: d.delta.text });
-      else if (d.delta.type === 'input_json_delta')
+      else if (d.delta.type === 'input_json_delta' && toolIdx.has(d.index))
         yield chunk({ tool_calls: [{ index: toolIdx.get(d.index), function: { arguments: d.delta.partial_json } }] });
     } else if (d.type === 'message_delta') {
       const out = d.usage?.output_tokens || 0;
-      yield chunk({}, STOP[d.delta?.stop_reason] || 'stop',
-        { usage: { prompt_tokens: inTok, completion_tokens: out, total_tokens: inTok + out } });
-    } else if (d.type === 'error') {
-      throw new Error(d.error?.message || 'upstream stream error');
+      const usage = { prompt_tokens: inTok, completion_tokens: out, total_tokens: inTok + out };
+      onUsage(usage);
+      yield chunk({}, STOP[d.delta?.stop_reason] || 'stop', { usage });
     }
   }
+  if (!started) throw new Upstream(502, 'empty stream');
   yield 'data: [DONE]\n\n';
 }
 
@@ -253,7 +291,9 @@ async function* sseEvents(reader) {
   for (;;) {
     const { value, done } = await reader.read();
     if (done) break;
-    buf += dec.decode(value, { stream: true });
+    // Normalise line endings on the joined buffer, not per chunk: a CRLF can straddle two chunks.
+    // A trailing lone CR is kept until the next chunk shows whether an LF follows it.
+    buf = (buf + dec.decode(value, { stream: true })).replace(/\r\n|\r(?!$)/g, '\n');
     let i;
     while ((i = buf.indexOf('\n\n')) >= 0) {
       const block = buf.slice(0, i); buf = buf.slice(i + 2);
@@ -263,16 +303,51 @@ async function* sseEvents(reader) {
   }
 }
 
+// OpenAI-compatible SSE is forwarded untouched, except that the first data event is inspected:
+// some providers answer 200 and then put the error in the stream, which must still fall back.
+async function* passthrough(reader, onUsage) {
+  const dec = new TextDecoder();
+  let head = '', checked = false, tail = '';
+  for (;;) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    const s = dec.decode(value, { stream: true });
+    tail = (tail + s).slice(-16_384);
+    if (!checked) {
+      head += s;
+      const m = head.replace(/\r\n/g, '\n').match(/^data:[ \t]*(.*)\n\n/m);
+      if (!m) continue; // keep buffering until the first data event is complete
+      checked = true;
+      let first;
+      try { first = JSON.parse(m[1]); } catch {}
+      if (first?.error) throw new Upstream(Number(first.error.code) || 502, first.error.message || JSON.stringify(first.error));
+      yield head;
+      continue;
+    }
+    yield s;
+  }
+  if (!checked) {
+    if (!head.trim()) throw new Upstream(502, 'empty stream');
+    yield head;
+  }
+  // Usage sits in the last chunk(s); parse whole events so nested objects are handled.
+  for (const ev of tail.replace(/\r\n/g, '\n').split('\n\n').reverse()) {
+    const line = ev.split('\n').find((l) => l.startsWith('data:'));
+    if (!line) continue;
+    try { const j = JSON.parse(line.slice(5)); if (j.usage) { onUsage(j.usage); break; } } catch {}
+  }
+}
+
 // ---------- upstream call ----------
-function buildRequest(t, key, body) {
+function buildRequest(t, key, body, endpoint) {
   const p = t.provider;
   if (p.type === 'anthropic') {
     return { url: `${p.baseUrl}/v1/messages`, payload: toAnthropic(body, t.model),
       headers: { 'x-api-key': key, 'anthropic-version': '2023-06-01', ...p.headers } };
   }
   const payload = { ...body, model: t.model };
-  if (payload.stream) payload.stream_options = { include_usage: true, ...payload.stream_options };
-  return { url: `${p.baseUrl}/chat/completions`, payload,
+  if (payload.stream && p.streamUsage) payload.stream_options = { include_usage: true, ...payload.stream_options };
+  return { url: `${p.baseUrl}${endpoint}`, payload,
     headers: { ...(key ? { authorization: `Bearer ${key}` } : {}), ...p.headers } };
 }
 
@@ -280,40 +355,64 @@ class Upstream extends Error {
   constructor(status, msg, retryAfter) { super(msg); this.status = status; this.retryAfter = retryAfter; }
 }
 
-async function callOnce(t, k, body, clientSignal) {
-  const { url, payload, headers } = buildRequest(t, k.key, body);
+// retry-after is either seconds or an HTTP date.
+function retryAfterS(v) {
+  if (!v) return 0;
+  const n = Number(v);
+  if (Number.isFinite(n)) return Math.max(0, n);
+  const d = Date.parse(v);
+  return Number.isFinite(d) ? Math.max(0, (d - Date.now()) / 1000) : 0;
+}
+
+async function callOnce(t, k, body, clientSignal, endpoint) {
+  const { url, payload, headers } = buildRequest(t, k.key, body, endpoint);
   const ctl = new AbortController();
-  const onAbort = () => ctl.abort();
+  let why = '';
+  const abort = (reason) => { why ||= reason; ctl.abort(); };
+  const onAbort = () => abort('client aborted');
   clientSignal.addEventListener('abort', onAbort, { once: true });
-  const total = setTimeout(() => ctl.abort(), TIMEOUT);
-  const firstByte = setTimeout(() => ctl.abort(), FIRST_BYTE_TIMEOUT);
-  const cleanup = () => { clearTimeout(total); clientSignal.removeEventListener('abort', onAbort); };
+  let timer = setTimeout(() => abort('first byte timeout'), FIRST_BYTE_TIMEOUT);
+  const arm = (ms, reason) => { clearTimeout(timer); timer = setTimeout(() => abort(reason), ms); };
+  const cleanup = () => { clearTimeout(timer); clientSignal.removeEventListener('abort', onAbort); };
   const t0 = Date.now();
   let res;
   try {
     res = await fetch(url, { method: 'POST', headers: { 'content-type': 'application/json', ...headers },
       body: JSON.stringify(payload), signal: ctl.signal });
   } catch (e) {
-    clearTimeout(firstByte); cleanup();
-    throw new Upstream(0, clientSignal.aborted ? 'client aborted' : `network: ${e.cause?.code || e.message}`);
+    cleanup();
+    throw new Upstream(0, why || `network: ${e.cause?.code || e.message}`);
   }
-  clearTimeout(firstByte);
   if (!res.ok) {
     const txt = await res.text().catch(() => '');
     cleanup();
-    const ra = Number(res.headers.get('retry-after')) || 0;
-    throw new Upstream(res.status, txt.slice(0, 500) || res.statusText, ra);
+    throw new Upstream(res.status, txt.slice(0, 500) || res.statusText, retryAfterS(res.headers.get('retry-after')));
   }
-  return { res, t0, cleanup };
+  // Streams get an idle timer re-armed on every chunk; plain calls get one overall deadline.
+  if (body.stream) arm(IDLE_TIMEOUT, 'stream idle timeout'); else arm(TIMEOUT, 'timeout');
+  const raw = res.body.getReader();
+  const reader = { read: async () => {
+    try {
+      const r = await raw.read();
+      if (body.stream) arm(IDLE_TIMEOUT, 'stream idle timeout');
+      return r;
+    } catch (e) { throw new Upstream(0, why || e.message); }
+  } };
+  return { res, reader, t0, cleanup };
 }
 
-// Errors that mean "try next target". 400/422 = bad request: same on every provider, stop.
+// Errors that mean "try next target". A 400 is the caller's fault and would fail everywhere,
+// except when it says the prompt is too long: a model with a bigger context may still take it.
+const TOO_LONG = /context|too (long|large)|maximum.*tokens|token limit|reduce the length/i;
 const retryable = (e) => e.status === 0 || e.status === 401 || e.status === 403 || e.status === 404
-  || e.status === 408 || e.status === 409 || e.status === 429 || e.status >= 500;
+  || e.status === 408 || e.status === 409 || e.status === 413 || e.status === 429 || e.status >= 500
+  || (e.status === 400 && TOO_LONG.test(e.message));
+// 401/403/429 are about one key: its siblings may still work. The rest condemns the target.
+const keyLevel = (e) => e.status === 401 || e.status === 403 || e.status === 429;
 
 // ---------- cache ----------
 const cache = new Map();
-const cacheKey = (b) => createHash('sha1').update(JSON.stringify(b)).digest('hex');
+const cacheKey = (b) => createHash('sha256').update(JSON.stringify(b)).digest('hex');
 function cacheGet(k) {
   const e = cache.get(k);
   if (!e) return null;
@@ -330,93 +429,92 @@ function cacheSet(k, v) {
 const stats = { requests: 0, cacheHits: 0, fallbacks: 0, failures: 0, tokens: { prompt: 0, completion: 0 } };
 const addUsage = (u) => { if (u) { stats.tokens.prompt += u.prompt_tokens || 0; stats.tokens.completion += u.completion_tokens || 0; } };
 
-// ---------- handlers ----------
-async function chat(req, res, body) {
+// ---------- routing ----------
+// Tries each (target, key) pair until one answers. Healthy pairs go first in combo order,
+// cooling ones stay as a last resort rather than failing outright.
+async function route(res, body, { endpoint, requested, cacheable }) {
   stats.requests++;
-  const requested = body.model;
-  const targets = resolve(requested || cfg.defaultModel || '');
+  const t0 = Date.now();
+  let targets = resolve(requested);
+  if (endpoint !== '/chat/completions') targets = targets.filter((t) => t.provider.type === 'openai');
   if (!targets.length) return send(res, 404, err(`unknown model "${requested}"`, 'model_not_found'));
-  compact(body);
 
-  const cacheable = !body.stream && CACHE_MAX > 0 && (body.temperature === 0 || cfg.cache?.always);
-  const ck = cacheable ? cacheKey({ ...body, model: requested }) : null;
+  const ck = cacheable && CACHE_MAX > 0 ? cacheKey({ endpoint, ...body, model: requested }) : null;
   if (ck) {
     const hit = cacheGet(ck);
-    if (hit) { stats.cacheHits++; return send(res, 200, hit, { 'x-bascule-cache': 'hit' }); }
+    if (hit) { stats.cacheHits++; log(200, requested, 'cache', t0, 0); return send(res, 200, hit, { 'x-bascule-cache': 'hit' }); }
   }
 
   const clientAbort = new AbortController();
   res.on('close', () => { if (!res.writableFinished) clientAbort.abort(); });
 
-  // Healthy (target, key) pairs first in combo order; cooled ones last as a final resort.
-  const pairs = targets.flatMap((t) => keysFor(t).map((k) => ({ t, k })));
-  pairs.sort((a, b) => a.k.cool - b.k.cool);
+  const now = Date.now();
+  const pairs = targets.flatMap((t) => keysFor(t, endpoint).map((k) => ({ t, k, cool: h(k.hid).until > now })));
+  pairs.sort((a, b) => a.cool - b.cool);
   const deadTargets = new Set();
   const errors = [];
-  let attempt = 0;
+  let attempt = 0, lastStatus = 503;
   for (const { t, k } of pairs) {
-      if (deadTargets.has(t.id)) continue;
-      if (clientAbort.signal.aborted) return;
-      if (attempt++) stats.fallbacks++;
-      let up;
-      try {
-        up = await callOnce(t, k, body, clientAbort.signal);
-      } catch (e) {
-        if (clientAbort.signal.aborted) return;
-        errors.push(`${t.id}: ${e.status || 'ERR'} ${e.message.slice(0, 160)}`);
-        cooldown(k.hid, e.status, e.retryAfter);
-        if (!retryable(e)) return send(res, e.status, err(e.message, 'upstream_error'));
-        // 401/403/429 are key-level: try next key. Anything else is provider-level: skip its other keys.
-        if (!(e.status === 401 || e.status === 403 || e.status === 429)) deadTargets.add(t.id);
-        continue;
+    if (deadTargets.has(t.id)) continue;
+    if (clientAbort.signal.aborted) return;
+    if (attempt++) stats.fallbacks++;
+    const head = { 'x-bascule-target': t.id };
+    let up;
+    try {
+      up = await callOnce(t, k, body, clientAbort.signal, endpoint);
+      if (body.stream) await pipeStream(up, t, res, head);
+      else {
+        const raw = await readJson(up.reader);
+        const out = t.provider.type === 'anthropic' ? fromAnthropic(raw, t.model) : raw;
+        addUsage(out.usage);
+        if (ck) cacheSet(ck, out);
+        send(res, 200, out, head);
       }
-      const head = { 'x-bascule-target': t.id };
-      try {
-        if (body.stream) await pipeStream(up, t, res, head);
-        else {
-          const raw = await up.res.json();
-          const out = t.provider.type === 'anthropic' ? fromAnthropic(raw, t.model) : raw;
-          addUsage(out.usage);
-          if (ck) cacheSet(ck, out);
-          send(res, 200, out, head);
-        }
-        success(k.hid, Date.now() - up.t0);
-      } catch (e) {
-        cooldown(k.hid, 0);
-        if (!res.headersSent) { errors.push(`${t.id}: ${e.message}`); up.cleanup(); continue; }
-        res.end(); // mid-stream failure: cannot fallback after bytes left
-      } finally { up.cleanup(); }
+      success(k.hid, Date.now() - up.t0);
+      log(200, requested, t.id, t0, attempt - 1);
       return;
+    } catch (e) {
+      if (clientAbort.signal.aborted) return;
+      const status = e instanceof Upstream ? e.status : 0;
+      errors.push(`${t.id}: ${status || 'ERR'} ${String(e.message).slice(0, 160)}`);
+      cooldown(k.hid, status, e.retryAfter);
+      if (res.headersSent) { // mid-stream: bytes already left, report in-band and stop
+        res.end(`data: ${JSON.stringify(err(`upstream ${t.id} failed mid-stream: ${e.message}`, 'upstream_error'))}\n\n`);
+        log(502, requested, t.id, t0, attempt - 1);
+        return;
+      }
+      if (!retryable({ status, message: String(e.message) })) {
+        log(status, requested, t.id, t0, attempt - 1);
+        return send(res, status, err(e.message, 'upstream_error'));
+      }
+      lastStatus = status === 429 ? 429 : 503;
+      if (!keyLevel({ status })) deadTargets.add(t.id);
+    } finally { up?.cleanup(); }
   }
   stats.failures++;
-  send(res, 503, err(`all targets failed:\n${errors.join('\n')}`, 'all_targets_failed'));
+  log(lastStatus, requested, 'none', t0, attempt - 1);
+  send(res, lastStatus, err(`all targets failed:\n${errors.join('\n')}`, 'all_targets_failed'));
+}
+
+async function readJson(reader) {
+  const chunks = [];
+  for (;;) { const { value, done } = await reader.read(); if (done) break; chunks.push(value); }
+  const s = Buffer.concat(chunks).toString('utf8');
+  try { return JSON.parse(s); } catch { throw new Upstream(502, `invalid JSON from upstream: ${s.slice(0, 120)}`); }
 }
 
 async function pipeStream(up, t, res, head) {
-  const reader = up.res.body.getReader();
-  const gen = t.provider.type === 'anthropic' ? anthropicStream(reader, t.model) : passthrough(reader);
-  // Pull first chunk before committing headers: allows fallback if upstream dies instantly.
+  const gen = t.provider.type === 'anthropic' ? anthropicStream(up.reader, t.model, addUsage) : passthrough(up.reader, addUsage);
+  // Pull the first chunk before committing headers: allows fallback if upstream dies instantly.
   const first = await gen.next();
   res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache',
     connection: 'keep-alive', 'x-accel-buffering': 'no', ...head });
   if (!first.done) res.write(first.value);
-  for await (const s of gen) if (!res.write(s)) await new Promise((r) => res.once('drain', r));
-  res.end();
-}
-
-async function* passthrough(reader) {
-  const dec = new TextDecoder();
-  let tail = '';
-  for (;;) {
-    const { value, done } = await reader.read();
-    if (done) break;
-    const s = dec.decode(value, { stream: true });
-    yield s;
-    // Track usage from final chunk without re-parsing everything.
-    tail = (tail + s).slice(-4096);
+  for await (const s of gen) {
+    if (res.destroyed) return;
+    if (!res.write(s)) await new Promise((r) => { res.once('drain', r); res.once('close', r); });
   }
-  const m = tail.match(/"usage":\s*(\{[^}]*\})/g);
-  if (m) try { addUsage(JSON.parse(m[m.length - 1].replace(/^"usage":\s*/, ''))); } catch {}
+  res.end();
 }
 
 function listModels() {
@@ -431,7 +529,12 @@ function status() {
   const targets = {};
   for (const [id, s] of health) targets[id] = { ok: s.ok, err: s.err, latencyMs: Math.round(s.lat),
     coolingForS: s.until > now ? Math.ceil((s.until - now) / 1000) : 0 };
-  return { uptimeS: Math.round(process.uptime()), providers: Object.keys(providers), cacheSize: cache.size, ...stats, targets };
+  return { version: VERSION, uptimeS: Math.round(process.uptime()), providers: Object.keys(providers),
+    cacheSize: cache.size, ...stats, targets };
+}
+
+function log(code, model, target, t0, fallbacks) {
+  if (LOG) console.log(`${new Date().toISOString()} ${code} ${model} -> ${target} ${Date.now() - t0}ms${fallbacks ? ` (${fallbacks} fallback${fallbacks > 1 ? 's' : ''})` : ''}`);
 }
 
 // ---------- http ----------
@@ -445,26 +548,31 @@ function send(res, code, obj, headers = {}) {
 function authed(req) {
   if (!API_KEY) return true;
   const got = (req.headers.authorization || '').replace(/^Bearer\s+/i, '') || req.headers['x-api-key'] || '';
-  const a = Buffer.from(String(got)), b = Buffer.from(API_KEY);
-  return a.length === b.length && timingSafeEqual(a, b);
+  // Compare digests: equal length always, so neither length nor content leaks through timing.
+  const d = (s) => createHash('sha256').update(String(s)).digest();
+  return timingSafeEqual(d(got), d(API_KEY));
 }
+class TooLarge extends Error {}
 function readBody(req, limit = 32 * 1024 * 1024) {
   return new Promise((ok, ko) => {
     const chunks = []; let n = 0;
-    req.on('data', (c) => { n += c.length; if (n > limit) { ko(new Error('body too large')); req.destroy(); } else chunks.push(c); });
+    req.on('data', (c) => { n += c.length; if (n > limit) { ko(new TooLarge()); req.pause(); } else chunks.push(c); });
     req.on('end', () => ok(Buffer.concat(chunks).toString('utf8')));
     req.on('error', ko);
   });
 }
 
+const ENDPOINTS = { '/v1/chat/completions': '/chat/completions', '/v1/embeddings': '/embeddings' };
+
 const server = http.createServer(async (req, res) => {
-  const path = req.url.split('?')[0].replace(/\/+$/, '');
+  const path = req.url.split('?')[0].replace(/\/+$/, '') || '/';
   // Any web page can fire requests at localhost. Only listed origins get through, otherwise
   // a malicious site could spend the owner's quotas even without reading the answer.
   const origin = req.headers.origin;
   if (origin) {
     if (!CORS.includes(origin) && !CORS.includes('*')) return send(res, 403, err(`origin ${origin} not allowed (config: corsOrigins)`, 'forbidden_origin'));
     res.setHeader('access-control-allow-origin', origin);
+    res.setHeader('access-control-expose-headers', 'x-bascule-target, x-bascule-cache');
     res.setHeader('vary', 'origin');
   }
   if (req.method === 'OPTIONS') {
@@ -473,16 +581,29 @@ const server = http.createServer(async (req, res) => {
   }
   if (path === '/health') return send(res, 200, { ok: true });
   if (!authed(req)) return send(res, 401, err('invalid api key', 'unauthorized'));
-  // A JSON content type cannot be sent by a plain HTML form, which closes the no-preflight CSRF path.
-  if (req.method === 'POST' && !/^application\/json\b/i.test(req.headers['content-type'] || ''))
-    return send(res, 415, err('content-type must be application/json', 'unsupported_media_type'));
   try {
-    if (req.method === 'GET' && path === '/v1/models') return send(res, 200, listModels());
+    if (req.method === 'GET' && (path === '/v1/models' || path === '/models')) return send(res, 200, listModels());
     if (req.method === 'GET' && path === '/stats') return send(res, 200, status());
-    if (req.method === 'POST' && path === '/v1/chat/completions') {
+    const endpoint = ENDPOINTS[path] || ENDPOINTS['/v1' + path];
+    if (req.method === 'POST' && endpoint) {
+      // A JSON content type cannot be sent by a plain HTML form, which closes the no-preflight CSRF path.
+      if (!/^application\/json\b/i.test(req.headers['content-type'] || ''))
+        return send(res, 415, err('content-type must be application/json', 'unsupported_media_type'));
       let body;
-      try { body = JSON.parse(await readBody(req)); } catch (e) { return send(res, 400, err(`bad json: ${e.message}`, 'invalid_request')); }
-      return await chat(req, res, body);
+      try { body = JSON.parse(await readBody(req)); }
+      catch (e) {
+        if (e instanceof TooLarge) { res.setHeader('connection', 'close'); return send(res, 413, err('body too large (32 MB max)', 'request_too_large')); }
+        return send(res, 400, err(`bad json: ${e.message}`, 'invalid_request'));
+      }
+      if (!body || typeof body !== 'object' || Array.isArray(body)) return send(res, 400, err('body must be a JSON object', 'invalid_request'));
+      const requested = typeof body.model === 'string' && body.model ? body.model : cfg.defaultModel || '';
+      if (endpoint === '/chat/completions') {
+        if (!Array.isArray(body.messages) || !body.messages.length) return send(res, 400, err('messages must be a non-empty array', 'invalid_request'));
+        compact(body);
+        return await route(res, body, { endpoint, requested,
+          cacheable: !body.stream && (body.temperature === 0 || cfg.cache?.always === true) });
+      }
+      return await route(res, { ...body, stream: false }, { endpoint, requested, cacheable: true });
     }
     send(res, 404, err('not found', 'not_found'));
   } catch (e) {
@@ -492,8 +613,18 @@ const server = http.createServer(async (req, res) => {
 });
 server.keepAliveTimeout = 65_000;
 server.headersTimeout = 66_000;
+server.requestTimeout = 0; // long generations must not be cut by Node's default 5 min limit
+server.on('error', (e) => {
+  console.error(e.code === 'EADDRINUSE' ? `port ${PORT} already in use (set BASCULE_PORT)` : e.message);
+  process.exit(1);
+});
 server.listen(PORT, HOST, () => {
-  console.log(`bascule on http://${HOST}:${PORT}/v1  providers: ${Object.keys(providers).join(', ') || '(none — set keys in .env)'}`);
+  console.log(`bascule ${VERSION} on http://${HOST}:${PORT}/v1  providers: ${Object.keys(providers).join(', ') || '(none — add keys to .env)'}`);
   console.log(`config: ${CONFIG_PATH}${API_KEY ? '' : '  (no BASCULE_KEY: any local program can use it)'}`);
 });
-for (const sig of ['SIGINT', 'SIGTERM']) process.on(sig, () => server.close(() => process.exit(0)));
+function shutdown() {
+  server.close(() => process.exit(0));
+  server.closeIdleConnections();
+  setTimeout(() => { server.closeAllConnections(); process.exit(0); }, 5000).unref();
+}
+for (const sig of ['SIGINT', 'SIGTERM']) process.on(sig, shutdown);

@@ -1,7 +1,7 @@
 {
   "name": "bascule",
   "version": "1.0.0",
-  "description": "Lean OpenAI-compatible AI router with fallback, key rotation, cooldowns, cache and Anthropic translation. Zero dependencies.",
+  "description": "Zero-dependency OpenAI-compatible AI router: automatic fallback across providers, key rotation, cooldowns, streaming, Anthropic translation, cache.",
   "type": "module",
   "bin": {
     "bascule": "server.mjs"
@@ -22,7 +22,10 @@
     "fallback",
     "ollama",
     "anthropic",
-    "gateway"
+    "gateway",
+    "failover",
+    "embeddings",
+    "llm-gateway"
   ],
   "files": [
     "server.mjs",
