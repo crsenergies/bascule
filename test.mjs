@@ -66,6 +66,7 @@ const limitedDate = await mock('limitedDate', (req, res) => { res.writeHead(429,
 const badKey = await mock('badKey', (req, res) => (req.headers.authorization === 'Bearer good' ? json(res, completion('second key')) : json(res, { error: 'bad key' }, 401)));
 const invalidKey400 = (req, res) => json(res, [{ error: { code: 400, message: 'Please pass a valid API key', status: 'INVALID_ARGUMENT' } }], 400);
 const badKey400 = await mock('badKey400', (req, res) => (req.headers.authorization === 'Bearer good' ? json(res, completion('ok after 400 key')) : invalidKey400(req, res)), invalidKey400);
+const unpaid = await mock('unpaid', (req, res) => json(res, { message: 'Payment required to access this resource. Visit your billing tab.', type: 'payment_required' }, 402));
 const broken = await mock('broken', (req, res) => json(res, { error: 'boom' }, 500));
 const badReq = await mock('badReq', (req, res) => json(res, { error: { message: 'temperature must be a number' } }, 400));
 const tooLong = await mock('tooLong', (req, res) => json(res, { error: { message: "This model's maximum context length is 8192 tokens" } }, 400));
@@ -162,14 +163,14 @@ writeFileSync(join(dir, 'config.json'), JSON.stringify({
   firstByteTimeoutMs: 300, idleTimeoutMs: 300, timeoutMs: 400, maxWaitMs: 1000,
   providers: {
     echo: P(echo, { models: ['m', 'only-here'] }), limited: P(limited, { keys: ['k1', 'k2'] }), limitedDate: P(limitedDate),
-    badKey: P(badKey, { keys: ['bad', 'good'] }), badKey400: P(badKey400, { keys: ['bad', 'good'] }), broken: P(broken, { keys: ['k1', 'k2', 'k3'] }), badReq: P(badReq), tooLong: P(tooLong),
+    badKey: P(badKey, { keys: ['bad', 'good'] }), badKey400: P(badKey400, { keys: ['bad', 'good'] }), broken: P(broken, { keys: ['k1', 'k2', 'k3'] }), unpaid: P(unpaid), badReq: P(badReq), tooLong: P(tooLong),
     tooBig: P(tooBig), streamErr: P(streamErr), streamEmpty: P(streamEmpty), namedErr: P(namedErr), blank: P(blank), lateErr: P(lateErr), toolFail: P(toolFail), streamCut: P(streamCut), streamStall: P(streamStall),
     silent: P(silent), flaky429: P(flaky429), shared: P(shared), budget: P(budget, { rpm: 2 }), small: P(small), daily: P(daily), quota: P(quota), slowBody: P(slowBody), garbage: P(garbage), hang: P(hang), fast: P(fast), slow: P(slow), tortoise: P(tortoise), fresh: P(fast), tuned: P(fast, { minMaxTokens: 1024, params: { reasoning_effort: 'low' } }), textOnly: P(textOnly), noTools: P(noTools),
     an: P(anthropic, { type: 'anthropic', keys: ['ak'], models: ['claude'] }), anCrlf: P(anthropicCrlf, { type: 'anthropic' }), anErr: P(anthropicErr, { type: 'anthropic' }),
     off: { baseUrl: 'http://127.0.0.1:1', keys: ['${UNSET_VAR}'], models: ['x'] },
   },
   combos: {
-    auto: ['limited/m', 'echo/m'], smart: ['echo/m'], quick: ['fast/m'], dated: ['limitedDate/m', 'echo/m'], keys: ['badKey/m'], keys400: ['badKey400/m'], dead: ['broken/m', 'echo/m'],
+    auto: ['limited/m', 'echo/m'], smart: ['echo/m'], quick: ['fast/m'], dated: ['limitedDate/m', 'echo/m'], keys: ['badKey/m'], keys400: ['badKey400/m'], dead: ['broken/m', 'echo/m'], unpaid: ['unpaid/m', 'echo/m'],
     badreq: ['badReq/m', 'echo/m'], toolong: ['tooLong/m', 'echo/m'], toobig: ['tooBig/m', 'echo/m'],
     serr: ['streamErr/m', 'echo/m'], sempty: ['streamEmpty/m', 'echo/m'], named: ['namedErr/m', 'echo/m'], blank: ['blank/m', 'echo/m'], late: ['lateErr/m', 'echo/m'], toolfail: ['toolFail/m', 'echo/m'], scut: ['streamCut/m', 'echo/m'], sstall: ['streamStall/m'],
     silent: ['silent/m', 'echo/m'], slowbody: ['slowBody/m', 'echo/m'], garbage: ['garbage/m', 'echo/m'], hang: ['hang/m'],
@@ -262,6 +263,14 @@ try {
   await test('400 "invalid API key" (Gemini style) is treated as a bad key', async () => {
     const r = await post({ model: 'keys400', messages: msg() });
     assert.equal((await r.json()).choices[0].message.content, 'ok after 400 key');
+  });
+  await test('402 payment required falls back and parks the target for hours', async () => {
+    const r = await post({ model: 'unpaid', messages: msg() });
+    assert.equal(r.status, 200);
+    assert.equal(r.headers.get('x-bascule-target'), 'echo/m');
+    await (await post({ model: 'unpaid', messages: msg() })).json();
+    assert.equal(hits.unpaid, 1, 'not retried while parked');
+    assert.ok((await stats()).targets['unpaid/m#0'].coolingForS > 5 * 3600);
   });
   await test('500 condemns the target without trying its other keys', async () => {
     const r = await post({ model: 'dead', messages: msg() });

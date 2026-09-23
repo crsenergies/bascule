@@ -153,9 +153,10 @@ function cooldown(id, status, retryAfter) {
   // Floor of 250 ms: a provider announcing "retry in 1ms" must not turn the wait loop into a busy loop.
   let ms = retryAfter ? Math.max(retryAfter * 1000, 250) : Math.min(1000 * 2 ** Math.min(s.fails, 8), 5 * 60_000);
   if (status === 401 || status === 403) ms = 30 * 60_000; // bad key: park it
+  if (status === 402) ms = 6 * 3600_000; // no credit on this account: nothing changes until someone pays
   s.until = Date.now() + ms;
   // A delay stated by the provider (or a dead key) is certain; a guessed backoff is not.
-  s.hard = Boolean(retryAfter) || status === 401 || status === 403;
+  s.hard = Boolean(retryAfter) || status === 401 || status === 402 || status === 403;
 }
 function success(id, ms) {
   const s = h(id);
@@ -705,11 +706,12 @@ const normalise = (status, message) => (status === 400 && BAD_KEY.test(message) 
 // The model produced something the provider itself rejected (Groq: invalid tool call). Another
 // model may do better; nothing is wrong with the request or the target in general.
 const GENERATION_FAILED = /tool_use_failed|tool call validation failed|failed to (call|parse) (a )?(function|tool)|output_parse_failed/i;
-const retryable = (e) => e.status === 0 || (e.status === 400 && GENERATION_FAILED.test(e.message)) || e.status === 401 || e.status === 403 || e.status === 404
+// 402 (payment required) is about one account, like a bad key: its sibling keys and targets may work.
+const retryable = (e) => e.status === 0 || (e.status === 400 && GENERATION_FAILED.test(e.message)) || e.status === 401 || e.status === 402 || e.status === 403 || e.status === 404
   || e.status === 408 || e.status === 409 || e.status === 413 || e.status === 429 || e.status >= 500
   || (e.status === 400 && TOO_LONG.test(e.message));
 // 401/403/429 are about one key: its siblings may still work. The rest condemns the target.
-const keyLevel = (e) => e.status === 401 || e.status === 403 || e.status === 429;
+const keyLevel = (e) => e.status === 401 || e.status === 402 || e.status === 403 || e.status === 429;
 
 // ---------- cache ----------
 const cache = new Map();
