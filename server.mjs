@@ -1151,59 +1151,145 @@ if (arg === 'dashboard') {
 
 // ---------- dashboard ----------
 // One self-contained page, no external assets. The strict CSP pins the inline style and script by hash.
+// Each combo is drawn as a railway line: requests leave from the left and stop at the first open station.
 const DASHBOARD_CSS = `
-:root { color-scheme: light dark; --bg: #f6f6f4; --card: #fff; --line: #e2e2dc; --text: #1d1d1b; --dim: #74746c;
-  --ok: #1f8a4c; --warn: #b7791f; --bad: #c53030; --idle: #a0a09a; }
-@media (prefers-color-scheme: dark) { :root { --bg: #151514; --card: #1f1f1d; --line: #33332f; --text: #ecece6; --dim: #9a9a92; --idle: #5c5c56; } }
+:root { color-scheme: light dark;
+  --paper: #f2f4f7; --panel: #ffffff; --ink: #14233a; --soft: #5b6b80; --rule: #d9dfe7; --track: #14233a;
+  --go: #1f9d55; --wait: #e09b14; --stop: #d8433b; --idle: #a7b0bc;
+  --round: ui-rounded, "SF Pro Rounded", "Nunito", "Varela Round", system-ui, sans-serif;
+  --text: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+@media (prefers-color-scheme: dark) {
+  :root { --paper: #0e1726; --panel: #16223a; --ink: #e8eef6; --soft: #9aabc2; --rule: #27364f; --track: #c9d5e6; --idle: #53627a; }
+}
 * { box-sizing: border-box; }
-body { margin: 0; font: 14px/1.45 system-ui, -apple-system, sans-serif; background: var(--bg); color: var(--text); }
-main { max-width: 980px; margin: 0 auto; padding: 24px 16px 48px; }
-header { display: flex; align-items: baseline; gap: 12px; flex-wrap: wrap; margin-bottom: 20px; }
-h1 { font-size: 22px; margin: 0; }
-h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .06em; color: var(--dim); margin: 28px 0 10px; }
-.dim { color: var(--dim); }
-.live::before { content: ""; display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: var(--ok); margin-right: 6px; }
-.live.down::before { background: var(--bad); }
-.grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(118px, 1fr)); gap: 10px; }
-.card { background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 12px 14px; }
-.card b { display: block; font-size: 22px; font-variant-numeric: tabular-nums; }
-.combo { background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 10px 14px; margin-bottom: 8px;
-  display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
-.combo > strong { min-width: 70px; }
-.chip { border-radius: 999px; padding: 2px 10px; font-size: 12px; border: 1px solid var(--line); }
-.chip::before, td.st::before { content: ""; display: inline-block; width: 7px; height: 7px; border-radius: 50%; margin-right: 6px; background: var(--idle); }
-.ready::before { background: var(--ok) !important; } .cooling::before { background: var(--warn) !important; } .failing::before { background: var(--bad) !important; }
-.arrow { color: var(--dim); }
-table { width: 100%; border-collapse: collapse; background: var(--card); border: 1px solid var(--line); border-radius: 10px; overflow: hidden; }
-th, td { text-align: left; padding: 7px 12px; border-bottom: 1px solid var(--line); font-variant-numeric: tabular-nums; }
-th { font-weight: 600; color: var(--dim); font-size: 12px; }
-tr:last-child td { border-bottom: 0; }
-td.num, th.num { text-align: right; }
-form { background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 16px; display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
-input { flex: 1; min-width: 220px; padding: 8px 10px; border: 1px solid var(--line); border-radius: 6px; background: var(--bg); color: var(--text); font: inherit; }
-button { padding: 8px 14px; border: 0; border-radius: 6px; background: var(--text); color: var(--bg); font: inherit; cursor: pointer; }
-.msg { width: 100%; color: var(--bad); margin: 0; }
+body { margin: 0; background: var(--paper); color: var(--ink); font: 16px/1.5 var(--text); -webkit-font-smoothing: antialiased; }
+main { max-width: 1040px; margin: 0 auto; padding: 28px 24px 64px; }
+:focus-visible { outline: 3px solid var(--go); outline-offset: 2px; border-radius: 4px; }
+
+.top { display: flex; align-items: center; gap: 10px; margin-bottom: 48px; }
+.brand { display: flex; align-items: center; gap: 10px; font: 700 20px var(--round); letter-spacing: -.01em; }
+.brand svg { width: 30px; height: 30px; }
+.top .meta { color: var(--soft); font-size: 14px; margin-left: auto; text-align: right; }
+.pulse { display: inline-block; width: 9px; height: 9px; border-radius: 50%; background: var(--go); margin-right: 7px; vertical-align: 1px; }
+.pulse.down { background: var(--stop); }
+
+.hero h1 { font: 800 clamp(34px, 6vw, 60px)/1.04 var(--round); letter-spacing: -.025em; margin: 0 0 14px; max-width: 16ch; }
+.hero p { font-size: clamp(17px, 2vw, 20px); color: var(--soft); margin: 0; max-width: 60ch; }
+.hero p strong { color: var(--ink); font-weight: 600; }
+.hero .code { font-family: ui-monospace, Menlo, monospace; font-size: .9em; background: var(--panel); border: 1px solid var(--rule); padding: 1px 6px; border-radius: 5px; color: var(--ink); }
+
+.numbers { display: flex; flex-wrap: wrap; margin: 40px 0 56px; border-top: 1px solid var(--rule); border-bottom: 1px solid var(--rule); }
+.numbers div { flex: 1 1 150px; padding: 18px 20px 18px 0; }
+.numbers div + div { padding-left: 20px; border-left: 1px solid var(--rule); }
+.numbers b { display: block; font: 800 34px/1.1 var(--round); font-variant-numeric: tabular-nums; letter-spacing: -.02em; }
+.numbers span { color: var(--soft); font-size: 14px; }
+.numbers .bad b { color: var(--stop); }
+
+h2 { font: 700 22px var(--round); margin: 0 0 4px; letter-spacing: -.01em; }
+.lead { color: var(--soft); margin: 0 0 24px; max-width: 64ch; }
+
+.line { background: var(--panel); border: 1px solid var(--rule); border-radius: 18px; padding: 20px 24px 22px; margin-bottom: 14px; }
+.line header { display: flex; align-items: baseline; gap: 12px; flex-wrap: wrap; margin-bottom: 18px; }
+.line header strong { font: 800 20px var(--round); }
+.line header span { color: var(--soft); font-size: 15px; }
+.line header span b { color: var(--ink); font-weight: 600; }
+.line.blocked { border-color: var(--stop); }
+.stops { list-style: none; margin: 0; padding: 0; display: flex; }
+.stop { position: relative; flex: 1 1 0; min-width: 0; padding-top: 34px; padding-right: 10px; }
+.stop::before { content: ""; position: absolute; top: 12px; left: 0; right: 0; height: 6px; background: var(--track); opacity: .9; }
+.stop:first-child::before { left: 12px; }
+.stop:last-child::before { right: calc(100% - 13px); }
+.stop:only-child::before { display: none; }
+.dot { position: absolute; top: 3px; left: 2px; width: 24px; height: 24px; border-radius: 50%; background: var(--panel); border: 6px solid var(--idle); }
+.go .dot { border-color: var(--go); } .wait .dot { border-color: var(--wait); } .stopped .dot { border-color: var(--stop); background: var(--stop); }
+.head .dot { border-color: var(--go); background: var(--go); box-shadow: 0 0 0 0 var(--go); animation: ring 2.4s ease-out infinite; }
+@keyframes ring { 0% { box-shadow: 0 0 0 0 color-mix(in srgb, var(--go) 55%, transparent); } 70%, 100% { box-shadow: 0 0 0 12px transparent; } }
+.stop .who { display: block; font-size: 12px; color: var(--soft); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.stop .what { display: block; font-weight: 600; font-size: 15px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.stop .how { display: block; font-size: 13px; margin-top: 2px; color: var(--soft); }
+.go .how { color: var(--go); } .wait .how { color: var(--wait); } .stopped .how { color: var(--stop); }
+
+.legend { display: flex; flex-wrap: wrap; gap: 8px 22px; margin: 18px 0 48px; color: var(--soft); font-size: 14px; padding: 0; list-style: none; }
+.legend i { display: inline-block; width: 12px; height: 12px; border-radius: 50%; border: 3px solid var(--idle); margin-right: 7px; vertical-align: -1px; }
+.legend .go i { border-color: var(--go); } .legend .wait i { border-color: var(--wait); } .legend .stopped i { border-color: var(--stop); background: var(--stop); }
+
+details { border-top: 1px solid var(--rule); padding-top: 16px; }
+summary { cursor: pointer; font: 700 17px var(--round); width: fit-content; }
+.tablewrap { overflow-x: auto; margin-top: 16px; }
+table { width: 100%; border-collapse: collapse; font-size: 14px; font-variant-numeric: tabular-nums; }
+th, td { text-align: left; padding: 9px 14px 9px 0; border-bottom: 1px solid var(--rule); white-space: nowrap; }
+th { color: var(--soft); font-weight: 600; }
+.num { text-align: right; }
+
+.gate { max-width: 520px; }
+.gate form { display: flex; gap: 10px; flex-wrap: wrap; margin-top: 24px; }
+.gate input { flex: 1 1 240px; font: inherit; padding: 12px 14px; border-radius: 10px; border: 1px solid var(--rule); background: var(--panel); color: var(--ink); }
+.gate button { font: 700 16px var(--round); padding: 12px 22px; border: 0; border-radius: 10px; background: var(--ink); color: var(--paper); cursor: pointer; }
+.gate .msg { color: var(--stop); width: 100%; margin: 0; min-height: 1.5em; }
+
+@media (max-width: 640px) {
+  main { padding: 20px 16px 48px; }
+  .top { margin-bottom: 32px; }
+  .numbers div { flex-basis: 45%; }
+  .numbers div + div { padding-left: 0; border-left: 0; }
+  .numbers div:nth-child(even) { padding-left: 16px; border-left: 1px solid var(--rule); }
+  .stops { flex-direction: column; }
+  .stop { flex: none; padding: 0 0 16px 40px; min-height: 44px; }
+  .stop::before { top: 0; bottom: 0; left: 11px; right: auto; width: 6px; height: auto; }
+  .stop:first-child::before { left: 11px; top: 12px; }
+  .stop:last-child::before { right: auto; bottom: calc(100% - 14px); }
+  .dot { top: 1px; left: 2px; }
+}
+@media (prefers-reduced-motion: reduce) { .head .dot { animation: none; } }
 [hidden] { display: none !important; }
 `;
 const DASHBOARD_JS = `
 const T = {
-  en: { requests: 'Requests', fallbacks: 'Fallbacks', failures: 'Failures', cacheHits: 'Cache hits', hedges: 'Hedged',
-    tokensIn: 'Tokens in', tokensOut: 'Tokens out', combos: 'Combos (tried in this order)', targets: 'Targets', target: 'Target',
-    state: 'State', latency: 'Latency', limit: 'Limit', ready: 'ready', cooling: 'pausing', failing: 'failing', idle: 'not used yet',
-    up: 'up', live: 'live', offline: 'router not reachable', key: 'Access key (BASCULE_KEY in ~/.bascule/.env)', save: 'Open',
-    badKey: 'Wrong key.', lacks: 'no ', none: 'No target used yet. Send a request to see it here.', perMin: '/min' },
-  fr: { requests: 'Requêtes', fallbacks: 'Bascules', failures: 'Échecs', cacheHits: 'Cache', hedges: 'Doublées',
-    tokensIn: 'Tokens entrée', tokensOut: 'Tokens sortie', combos: 'Combos (essayés dans cet ordre)', targets: 'Modèles', target: 'Modèle',
-    state: 'État', latency: 'Latence', limit: 'Limite', ready: 'prêt', cooling: 'en pause', failing: 'en échec', idle: 'pas encore utilisé',
-    up: 'actif depuis', live: 'en direct', offline: 'routeur injoignable', key: 'Clé d’accès (BASCULE_KEY dans ~/.bascule/.env)', save: 'Ouvrir',
-    badKey: 'Mauvaise clé.', lacks: 'sans ', none: 'Aucun modèle utilisé. Envoie une requête pour le voir ici.', perMin: '/min' },
+  en: {
+    live: 'live', offline: 'not answering', up: 'running for ',
+    allGood: 'All good.', detours: 'All good, with detours.', idleTitle: 'Ready.', blocked: (n) => n + ' blocked.', down: 'Bascule is not answering.',
+    idleText: (u) => 'Waiting for the first request. Point your app at <span class="code">' + u + '</span> and use the model <span class="code">auto</span>.',
+    summary: (up, ok, fb) => 'In the last ' + up + ': <strong>' + ok + ' requests answered</strong>' + (fb ? ', <strong>' + fb + '</strong> of them rescued by switching to another model.' : '.'),
+    detourText: (n) => ' ' + n + (n > 1 ? ' models are' : ' model is') + ' taking a break; requests go to the next ones.',
+    blockedText: ' Every model on this line is paused or failing: requests there will fail until one comes back.',
+    downText: 'Start it again with the command <span class="code">bascule</span>. This page reconnects by itself.',
+    answered: 'answered', switched: 'switched model', failed: 'failed', words: 'words read', written: 'words written', cached: 'from memory',
+    linesTitle: 'Your lines', linesLead: 'A request starts on the left and stops at the first open station. If that one is busy or broken, it simply rolls on to the next.',
+    now: 'goes to', blockedLine: 'no station open',
+    go: 'open', wait: (s) => 'back in ' + s, stopped: 'not working', idle: 'not used yet',
+    lgo: 'open: answers requests', lwait: 'taking a break (limit reached), comes back alone', lstopped: 'not working (check the key)', lidle: 'not used yet',
+    details: 'Technical details', model: 'Model and key', state: 'State', ok: 'Answered', err: 'Errors', latency: 'Speed', limit: 'Limit', cannot: 'Cannot',
+    perMin: '/min', vision: 'images', tools: 'tools',
+    gateTitle: 'This page is locked.', gateText: 'Paste your access key. It is the BASCULE_KEY line in ~/.bascule/.env, or run bascule dashboard to open this page already unlocked.',
+    open: 'Unlock', badKey: 'That key does not match. Check the BASCULE_KEY line again.', placeholder: 'access key' },
+  fr: {
+    live: 'en direct', offline: 'ne répond pas', up: 'actif depuis ',
+    allGood: 'Tout roule.', detours: 'Tout roule, avec des détours.', idleTitle: 'Prêt.', blocked: (n) => n + ' à l’arrêt.', down: 'Bascule ne répond pas.',
+    idleText: (u) => 'En attente de la première demande. Règle ton application sur <span class="code">' + u + '</span> avec le modèle <span class="code">auto</span>.',
+    summary: (up, ok, fb) => 'Depuis ' + up + ' : <strong>' + ok + ' demandes servies</strong>' + (fb ? ', dont <strong>' + fb + '</strong> sauvées en changeant de modèle.' : '.'),
+    detourText: (n) => ' ' + n + (n > 1 ? ' modèles font' : ' modèle fait') + ' une pause ; les demandes passent par les suivants.',
+    blockedText: ' Tous les modèles de cette ligne sont en pause ou en panne : les demandes y échouent jusqu’au retour de l’un d’eux.',
+    downText: 'Relance-le avec la commande <span class="code">bascule</span>. Cette page se reconnecte toute seule.',
+    answered: 'demandes servies', switched: 'changements de modèle', failed: 'échecs', words: 'mots lus', written: 'mots écrits', cached: 'réponses en mémoire',
+    linesTitle: 'Tes lignes', linesLead: 'Une demande part de la gauche et s’arrête à la première station ouverte. Si elle est occupée ou en panne, la demande continue simplement vers la suivante.',
+    now: 'va vers', blockedLine: 'aucune station ouverte',
+    go: 'ouvert', wait: (s) => 'retour dans ' + s, stopped: 'en panne', idle: 'pas encore utilisé',
+    lgo: 'ouvert : répond aux demandes', lwait: 'en pause (limite atteinte), revient tout seul', lstopped: 'en panne (vérifie la clé)', lidle: 'pas encore utilisé',
+    details: 'Détails techniques', model: 'Modèle et clé', state: 'État', ok: 'Servies', err: 'Erreurs', latency: 'Vitesse', limit: 'Limite', cannot: 'Ne sait pas',
+    perMin: '/min', vision: 'images', tools: 'outils',
+    gateTitle: 'Cette page est verrouillée.', gateText: 'Colle ta clé d’accès. C’est la ligne BASCULE_KEY dans ~/.bascule/.env. Ou lance bascule dashboard pour ouvrir cette page déjà déverrouillée.',
+    open: 'Déverrouiller', badKey: 'Cette clé ne correspond pas. Vérifie la ligne BASCULE_KEY.', placeholder: 'clé d’accès' },
 };
-const L = T[(navigator.language || 'en').slice(0, 2)] || T.en;
+const lang = (navigator.language || 'en').slice(0, 2);
+const L = T[lang] || T.en;
+document.documentElement.lang = T[lang] ? lang : 'en';
 const $ = (id) => document.getElementById(id);
 const el = (tag, cls, ...kids) => { const e = document.createElement(tag); if (cls) e.className = cls; e.append(...kids.map((k) => k instanceof Node ? k : String(k))); return e; };
-const fmt = (n) => Number(n || 0).toLocaleString();
-const dur = (s) => s >= 86400 ? Math.floor(s / 86400) + 'd ' + Math.floor(s % 86400 / 3600) + 'h'
-  : s >= 3600 ? Math.floor(s / 3600) + 'h ' + Math.floor(s % 3600 / 60) + 'm' : s >= 60 ? Math.floor(s / 60) + 'm ' + (s % 60) + 's' : s + 's';
+const esc = (s) => String(s).replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' })[c]);
+const fmt = (n) => Math.round(Number(n || 0)).toLocaleString(lang);
+const dur = (s) => s >= 86400 ? Math.floor(s / 86400) + (lang === 'fr' ? ' j ' : ' d ') + Math.floor(s % 86400 / 3600) + ' h'
+  : s >= 3600 ? Math.floor(s / 3600) + ' h ' + Math.floor(s % 3600 / 60) + ' min' : s >= 60 ? Math.floor(s / 60) + ' min' : s + ' s';
+const endpoint = location.origin + '/v1';
 
 let key = localStorage.getItem('bascule-key') || '';
 function keyFromHash() {
@@ -1213,90 +1299,120 @@ function keyFromHash() {
 keyFromHash();
 addEventListener('hashchange', () => { keyFromHash(); poll(); });
 
-$('keylabel').textContent = L.key; $('save').textContent = L.save;
+$('gate-title').textContent = L.gateTitle; $('gate-text').textContent = L.gateText; $('open').textContent = L.open;
+$('keyinput').placeholder = L.placeholder;
 $('keyform').addEventListener('submit', (e) => { e.preventDefault(); key = $('keyinput').value.trim(); localStorage.setItem('bascule-key', key); $('keyinput').value = ''; poll(); });
+$('lines-title').textContent = L.linesTitle; $('lines-lead').textContent = L.linesLead; $('details-title').textContent = L.details;
+$('legend').replaceChildren(...[['go', L.lgo], ['wait', L.lwait], ['stopped', L.lstopped], ['idle', L.lidle]].map(([c, t]) => el('li', c, el('i'), t)));
 
 function stateOf(t) {
   if (!t) return 'idle';
-  if (t.coolingForS) return 'cooling';
+  if (t.coolingForS) return 'wait';
   if (!t.ok && !t.err) return 'idle';
-  return t.ok ? 'ready' : 'failing';
+  return t.ok ? 'go' : 'stopped';
 }
-// Several keys per model: the model is usable while one key is.
-function stateOfModel(st, id) {
+// Several keys per model: the model is open while one key is.
+function station(st, id) {
   const ks = Object.entries(st.targets).filter(([hid]) => hid.startsWith(id + '#')).map(([, t]) => t);
-  if (!ks.length) return { s: 'idle', t: null };
-  for (const s of ['ready', 'idle']) { const t = ks.find((k) => stateOf(k) === s); if (t) return { s, t }; }
-  const cooling = ks.filter((t) => t.coolingForS).sort((a, b) => a.coolingForS - b.coolingForS)[0];
-  return cooling ? { s: 'cooling', t: cooling } : { s: 'failing', t: ks[0] };
+  if (!ks.length) return { s: 'idle' };
+  for (const s of ['go', 'idle']) { const t = ks.find((k) => stateOf(k) === s); if (t) return { s, t }; }
+  const t = ks.filter((k) => k.coolingForS).sort((a, b) => a.coolingForS - b.coolingForS)[0];
+  return t ? { s: 'wait', t } : { s: 'stopped', t: ks[0] };
 }
-const label = (s, t) => L[s] + (s === 'cooling' ? ' ' + dur(t.coolingForS) : '');
+const say = (s, t) => s === 'wait' ? L.wait(dur(t.coolingForS)) : L[s];
+const split = (id) => { const i = id.indexOf('/'); return [id.slice(0, i), id.slice(i + 1)]; };
 
 function render(st) {
-  $('version').textContent = 'v' + st.version;
-  $('uptime').textContent = L.up + ' ' + dur(st.uptimeS);
-  const cards = [[L.requests, st.requests], [L.fallbacks, st.fallbacks], [L.failures, st.failures], [L.cacheHits, st.cacheHits],
-    [L.hedges, st.hedges], [L.tokensIn, st.tokens.prompt], [L.tokensOut, st.tokens.completion]];
-  $('cards').replaceChildren(...cards.map(([k, v]) => { const c = el('div', 'card', k); c.prepend(el('b', '', fmt(v))); return c; }));
+  $('meta').replaceChildren(el('span', 'pulse'), L.live + ' · ' + L.up + dur(st.uptimeS) + ' · v' + st.version);
+  const lines = Object.entries(st.combos || {}).map(([name, ids]) => {
+    const stops = ids.map((id) => ({ id, ...station(st, id) }));
+    return { name, stops, head: stops.find((x) => x.s === 'go' || x.s === 'idle') };
+  });
+  const paused = new Set(lines.flatMap((l) => l.stops.filter((x) => x.s === 'wait' || x.s === 'stopped').map((x) => x.id))).size;
+  const blocked = lines.filter((l) => l.stops.length && !l.head);
+  const answered = st.requests - st.failures;
 
-  $('combos').replaceChildren(...Object.entries(st.combos || {}).map(([name, ids]) => {
-    const row = el('div', 'combo', el('strong', '', name));
-    ids.forEach((id, i) => {
-      const { s, t } = stateOfModel(st, id);
-      const chip = el('span', 'chip ' + s, id);
-      chip.title = label(s, t) + (st.cannot[id] ? ' · ' + L.lacks + st.cannot[id].join(', ') : '');
-      if (i) row.append(el('span', 'arrow', '→'));
-      row.append(chip);
-    });
-    return row;
+  let title, text;
+  if (blocked.length) { title = L.blocked(blocked.map((l) => l.name).join(', ')); text = L.blockedText; }
+  else if (!st.requests) { title = L.idleTitle; text = L.idleText(esc(endpoint)); }
+  else if (paused) { title = L.detours; text = L.summary(dur(st.uptimeS), fmt(answered), st.fallbacks && fmt(st.fallbacks)) + L.detourText(paused); }
+  else { title = L.allGood; text = L.summary(dur(st.uptimeS), fmt(answered), st.fallbacks && fmt(st.fallbacks)); }
+  if (blocked.length && st.requests) text = L.summary(dur(st.uptimeS), fmt(answered), st.fallbacks && fmt(st.fallbacks)) + text;
+  $('title').textContent = title; $('text').innerHTML = text;
+
+  // About 0.75 English words per token: close enough to give a feel for the volume.
+  const nums = [[answered, L.answered], [st.fallbacks, L.switched], [st.failures, L.failed, st.failures > 0],
+    [st.tokens.prompt * 0.75, L.words], [st.tokens.completion * 0.75, L.written]];
+  if (st.cacheHits) nums.push([st.cacheHits, L.cached]);
+  $('numbers').replaceChildren(...nums.map(([n, label, bad]) => el('div', bad ? 'bad' : '', el('b', '', fmt(n)), el('span', '', label))));
+
+  $('lines').replaceChildren(...lines.map((l) => {
+    const head = l.head ? split(l.head.id).reverse().join(' · ') : null;
+    const sub = el('span');
+    if (head) sub.append(L.now + ' ', el('b', '', head)); else sub.append(L.blockedLine);
+    const ol = el('ol', 'stops', ...l.stops.map((x) => {
+      const [who, what] = split(x.id);
+      const li = el('li', 'stop ' + x.s + (x === l.head && x.s === 'go' ? ' head' : ''), el('span', 'dot'), el('span', 'who', who), el('span', 'what', what), el('span', 'how', say(x.s, x.t)));
+      li.title = x.id;
+      return li;
+    }));
+    return el('section', 'line' + (l.head ? '' : ' blocked'), el('header', '', el('strong', '', l.name), sub), ol);
   }));
 
   const rows = Object.entries(st.targets).sort(([a], [b]) => a.localeCompare(b));
-  $('none').hidden = rows.length > 0; $('table').hidden = !rows.length;
-  $('thead').replaceChildren(el('tr', '', el('th', '', L.target), el('th', '', L.state), el('th', 'num', 'ok'), el('th', 'num', 'err'),
-    el('th', 'num', L.latency), el('th', 'num', L.limit), el('th', '', '')));
+  $('details').hidden = !rows.length;
+  $('thead').replaceChildren(el('tr', '', el('th', '', L.model), el('th', '', L.state), el('th', 'num', L.ok), el('th', 'num', L.err),
+    el('th', 'num', L.latency), el('th', 'num', L.limit), el('th', '', L.cannot)));
   $('tbody').replaceChildren(...rows.map(([hid, t]) => {
     const s = stateOf(t), base = hid.replace(/^[a-z]+:/, '').replace(/#[0-9]+$/, '');
-    return el('tr', '', el('td', '', hid), el('td', 'st ' + s, label(s, t)), el('td', 'num', fmt(t.ok)), el('td', 'num', fmt(t.err)),
+    return el('tr', '', el('td', '', hid), el('td', '', say(s, t)), el('td', 'num', fmt(t.ok)), el('td', 'num', fmt(t.err)),
       el('td', 'num', t.ok ? t.latencyMs + ' ms' : '–'), el('td', 'num', t.learnedRpm ? t.learnedRpm + L.perMin : ''),
-      el('td', 'dim', st.cannot[base] ? L.lacks + st.cannot[base].join(', ') : ''));
+      el('td', '', (st.cannot[base] || []).map((c) => L[c] || c).join(', ')));
   }));
 }
 
+function show(view) { for (const v of ['gate', 'app']) $(v).hidden = v !== view; }
 async function poll() {
   clearTimeout(poll.timer);
   try {
     const r = await fetch('/stats', { headers: key ? { authorization: 'Bearer ' + key } : {}, cache: 'no-store' });
     if (r.status === 401) {
-      $('keyform').hidden = false; $('app').hidden = true; $('version').textContent = $('uptime').textContent = $('live').textContent = '';
+      show('gate'); $('meta').textContent = '';
       $('keymsg').textContent = key ? L.badKey : ''; $('keyinput').focus();
       return;
     }
     if (!r.ok) throw new Error('HTTP ' + r.status);
-    $('keyform').hidden = true; $('app').hidden = false;
+    show('app');
     render(await r.json());
-    $('live').className = 'live'; $('live').textContent = L.live;
   } catch {
-    $('live').className = 'live down'; $('live').textContent = L.offline;
+    show('app');
+    $('meta').replaceChildren(el('span', 'pulse down'), L.offline);
+    $('title').textContent = L.down; $('text').innerHTML = L.downText;
   }
   poll.timer = setTimeout(poll, document.hidden ? 10000 : 2000);
 }
 document.addEventListener('visibilitychange', () => { if (!document.hidden) poll(); });
-$('h-combos').textContent = L.combos; $('h-targets').textContent = L.targets; $('none').textContent = L.none;
 poll();
 `;
 const DASHBOARD = `<!doctype html>
-<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
 <title>bascule</title><style>${DASHBOARD_CSS}</style></head>
 <body><main>
-<header><h1>bascule</h1><span id="version" class="dim"></span><span id="uptime" class="dim"></span><span id="live" class="live"></span></header>
-<form id="keyform" hidden><label id="keylabel" for="keyinput"></label><input id="keyinput" type="password" autocomplete="off">
-<button id="save" type="submit"></button><p id="keymsg" class="msg"></p></form>
+<div class="top">
+  <div class="brand"><svg viewBox="0 0 32 32" aria-hidden="true"><path d="M3 22h26" stroke="currentColor" stroke-width="4" stroke-linecap="round"/><path d="M10 22c5 0 8-12 19-12" fill="none" stroke="#1f9d55" stroke-width="4" stroke-linecap="round"/></svg>bascule</div>
+  <div class="meta" id="meta" aria-live="polite"></div>
+</div>
+<section id="gate" class="gate hero" hidden>
+  <h1 id="gate-title"></h1><p id="gate-text"></p>
+  <form id="keyform"><input id="keyinput" type="password" autocomplete="off" aria-labelledby="gate-text"><button id="open" type="submit"></button><p id="keymsg" class="msg" role="alert"></p></form>
+</section>
 <div id="app" hidden>
-<div id="cards" class="grid"></div>
-<h2 id="h-combos"></h2><div id="combos"></div>
-<h2 id="h-targets"></h2><p id="none" class="dim"></p>
-<table id="table"><thead id="thead"></thead><tbody id="tbody"></tbody></table>
+  <section class="hero"><h1 id="title"></h1><p id="text"></p></section>
+  <div class="numbers" id="numbers"></div>
+  <h2 id="lines-title"></h2><p class="lead" id="lines-lead"></p>
+  <div id="lines"></div>
+  <ul class="legend" id="legend"></ul>
+  <details id="details"><summary id="details-title"></summary><div class="tablewrap"><table><thead id="thead"></thead><tbody id="tbody"></tbody></table></div></details>
 </div>
 </main><script>${DASHBOARD_JS}</script></body></html>`;
 const sha = (s) => `'sha256-${createHash('sha256').update(s).digest('base64')}'`;
