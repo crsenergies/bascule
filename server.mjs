@@ -1,6 +1,8 @@
 #!/usr/bin/env node
 // Bascule — lean OpenAI-compatible AI router. Zero dependencies, Node >= 20.
 import http from 'node:http';
+import https from 'node:https';
+import zlib from 'node:zlib';
 import { readFileSync, existsSync, mkdirSync, copyFileSync, writeFileSync, watchFile, renameSync } from 'node:fs';
 import { createHash, timingSafeEqual, randomBytes } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
@@ -135,6 +137,7 @@ function reload(reason) {
     if (!LOOPBACK && (key.length < 16 || key === 'change-me')) throw new Error('BASCULE_KEY too weak for a non-local address');
     cfg = next; providers = nextProviders;
     applySettings();
+    warmUp();
     console.log(`reloaded (${reason})  providers: ${Object.keys(providers).join(', ') || '(none)'}`);
   } catch (e) {
     console.error(`reload failed, keeping previous config: ${e.message}`);
@@ -348,39 +351,56 @@ async function* sseEvents(reader) {
   }
 }
 
-// OpenAI-compatible SSE is forwarded untouched, except that the first data event is inspected:
-// some providers answer 200 and then put the error in the stream, which must still fall back.
+// OpenAI-compatible SSE is forwarded untouched, except that nothing is committed to the client
+// until a meaningful event arrives (text, tool call or finish). Providers may answer 200 and then
+// put the error in the stream, after a content-free first chunk (Groq does this for tool calls
+// it rejects): such an error must still fall back to the next target.
+const inBandError = (d) => d?.error && new Upstream(Number(d.error.code) || (d.error.code === 'tool_use_failed' ? 400 : 502),
+  d.error.message || JSON.stringify(d.error));
 async function* passthrough(reader, onUsage) {
   const dec = new TextDecoder();
-  let head = '', checked = false, tail = '';
+  let head = '', committed = false, tail = '';
   for (;;) {
     const { value, done } = await reader.read();
     if (done) break;
     const s = dec.decode(value, { stream: true });
     tail = (tail + s).slice(-16_384);
-    if (!checked) {
-      head += s;
-      const m = head.replace(/\r\n/g, '\n').match(/^data:[ \t]*(.*)\n\n/m);
-      if (!m) continue; // keep buffering until the first data event is complete
-      checked = true;
-      let first;
-      try { first = JSON.parse(m[1]); } catch {}
-      if (first?.error) throw new Upstream(Number(first.error.code) || 502, first.error.message || JSON.stringify(first.error));
-      yield head;
+    if (committed) {
+      // A late in-band error cannot fall back any more, but must still be counted as a failure.
+      if (s.includes('"error"')) for (const d of dataEvents(s)) if (d?.error && !d.choices) throw inBandError(d);
+      yield s;
       continue;
     }
-    yield s;
+    head += s;
+    const complete = head.replace(/\r\n/g, '\n');
+    const cut = complete.lastIndexOf('\n\n');
+    if (cut < 0) continue;
+    for (const d of dataEvents(complete.slice(0, cut + 2))) {
+      if (d?.error && !d.choices) throw inBandError(d);
+      const c = d?.choices?.[0];
+      if (c && (c.delta?.content || c.delta?.tool_calls)) committed = true;
+    }
+    if (committed) { yield head; head = ''; }
   }
-  if (!checked) {
-    if (!head.trim()) throw new Upstream(502, 'empty stream');
-    yield head;
-  }
+  // Ended without a single word or tool call: an empty answer (free routers produce these),
+  // so the next target gets a chance instead of the client receiving nothing.
+  if (!committed) throw new Upstream(502, head.trim() ? 'empty answer' : 'empty stream');
   // Usage sits in the last chunk(s); parse whole events so nested objects are handled.
   for (const ev of tail.replace(/\r\n/g, '\n').split('\n\n').reverse()) {
     const line = ev.split('\n').find((l) => l.startsWith('data:'));
     if (!line) continue;
     try { const j = JSON.parse(line.slice(5)); if (j.usage) { onUsage(j.usage); break; } } catch {}
   }
+}
+// JSON payloads of the complete data events in an SSE text ([DONE] and comments skipped).
+function dataEvents(txt) {
+  const out = [];
+  for (const block of txt.replace(/\r\n/g, '\n').split('\n\n')) {
+    const data = block.split('\n').filter((l) => l.startsWith('data:')).map((l) => l.slice(5).trimStart()).join('\n');
+    if (!data || data === '[DONE]') continue;
+    try { out.push(JSON.parse(data)); } catch {}
+  }
+  return out;
 }
 
 // ---------- inbound Anthropic Messages API ----------
@@ -444,6 +464,8 @@ function toAnthropicMessage(o, model) {
   for (const tc of m.tool_calls || []) {
     let input = {};
     try { input = JSON.parse(tc.function?.arguments || '{}'); } catch {}
+    // Anthropic requires an object; some models emit an array or a bare value.
+    if (!input || typeof input !== 'object' || Array.isArray(input)) input = { value: input };
     content.push({ type: 'tool_use', id: toolId(tc.id), name: tc.function?.name, input });
   }
   const u = o.usage || {};
@@ -560,6 +582,52 @@ function rpmFromBody(txt) {
   return m ? Number(m[1]) : 0;
 }
 
+// Upstream transport. Node's fetch drops idle connections after about 4 s, so every request after
+// a pause paid a new TLS handshake (100-200 ms measured). These agents keep sockets open for as
+// long as the provider allows (45 s+ on Groq, Gemini and OpenRouter).
+const agents = {
+  'http:': new http.Agent({ keepAlive: true, keepAliveMsecs: 15_000, scheduling: 'lifo' }),
+  'https:': new https.Agent({ keepAlive: true, keepAliveMsecs: 15_000, scheduling: 'lifo' }),
+};
+// Minimal fetch-like wrapper over http(s).request: status, headers.get, text() and a chunk reader.
+function request(url, { headers, body, signal }) {
+  return new Promise((ok, ko) => {
+    const u = new URL(url);
+    const lib = u.protocol === 'https:' ? https : http;
+    const req = lib.request(u, { method: 'POST', agent: agents[u.protocol], headers: { ...headers, 'content-length': Buffer.byteLength(body) } }, (res) => {
+      const enc = String(res.headers['content-encoding'] || '').toLowerCase();
+      const stream = enc === 'gzip' || enc === 'x-gzip' ? res.pipe(zlib.createGunzip()) : enc === 'br' ? res.pipe(zlib.createBrotliDecompress())
+        : enc === 'deflate' ? res.pipe(zlib.createInflate()) : res;
+      if (stream !== res) res.on('error', (e) => stream.destroy(e));
+      const it = stream[Symbol.asyncIterator]();
+      ok({
+        status: res.statusCode, ok: res.statusCode >= 200 && res.statusCode < 300, statusText: res.statusMessage,
+        headers: { get: (n) => { const v = res.headers[n.toLowerCase()]; return Array.isArray(v) ? v.join(', ') : v ?? null; } },
+        reader: { read: async () => { const r = await it.next(); return r.done ? { done: true } : { done: false, value: r.value }; } },
+        text: async () => { const parts = []; for await (const c of stream) parts.push(c); return Buffer.concat(parts).toString('utf8'); },
+      });
+    });
+    const onAbort = () => req.destroy(new Error('aborted'));
+    if (signal.aborted) onAbort(); else signal.addEventListener('abort', onAbort, { once: true });
+    req.on('error', ko);
+    req.on('close', () => signal.removeEventListener('abort', onAbort));
+    req.setNoDelay(true);
+    req.end(body);
+  });
+}
+
+// Open a kept-alive connection to every provider ahead of the first real request.
+function warmUp() {
+  for (const p of Object.values(providers)) {
+    const u = new URL(p.type === 'anthropic' ? `${p.baseUrl}/v1/models` : `${p.baseUrl}/models`);
+    const lib = u.protocol === 'https:' ? https : http;
+    const headers = p.type === 'anthropic' ? { 'x-api-key': p.keys[0], 'anthropic-version': '2023-06-01' }
+      : p.keys[0] ? { authorization: `Bearer ${p.keys[0]}` } : {};
+    lib.get(u, { agent: agents[u.protocol], headers: { ...headers, ...p.headers }, timeout: 10_000 }, (res) => res.resume())
+      .on('timeout', function () { this.destroy(); }).on('error', () => {});
+  }
+}
+
 async function callOnce(t, k, body, clientSignal, endpoint) {
   const { url, payload, headers } = buildRequest(t, k.key, body, endpoint);
   const ctl = new AbortController();
@@ -573,11 +641,11 @@ async function callOnce(t, k, body, clientSignal, endpoint) {
   const t0 = Date.now();
   let res;
   try {
-    res = await fetch(url, { method: 'POST', headers: { 'content-type': 'application/json', ...headers },
+    res = await request(url, { headers: { 'content-type': 'application/json', 'accept-encoding': 'gzip, br', ...headers },
       body: JSON.stringify(payload), signal: ctl.signal });
   } catch (e) {
     cleanup();
-    throw new Upstream(0, why || `network: ${e.cause?.code || e.message}`);
+    throw new Upstream(0, why || `network: ${e.code || e.cause?.code || e.message}`);
   }
   if (!res.ok) {
     const txt = await res.text().catch(() => '');
@@ -587,7 +655,7 @@ async function callOnce(t, k, body, clientSignal, endpoint) {
   }
   // Streams get an idle timer re-armed on every chunk; plain calls get one overall deadline.
   if (body.stream) arm(IDLE_TIMEOUT, 'stream idle timeout'); else arm(TIMEOUT, 'timeout');
-  const raw = res.body.getReader();
+  const raw = res.reader;
   const reader = { read: async () => {
     try {
       const r = await raw.read();
@@ -641,7 +709,10 @@ function saveState() {
   } catch (e) { console.error(`cannot save ${STATE_PATH}: ${e.message}`); }
 }
 const normalise = (status, message) => (status === 400 && BAD_KEY.test(message) ? 401 : status);
-const retryable = (e) => e.status === 0 || e.status === 401 || e.status === 403 || e.status === 404
+// The model produced something the provider itself rejected (Groq: invalid tool call). Another
+// model may do better; nothing is wrong with the request or the target in general.
+const GENERATION_FAILED = /tool_use_failed|tool call validation failed|failed to (call|parse) (a )?(function|tool)|output_parse_failed/i;
+const retryable = (e) => e.status === 0 || (e.status === 400 && GENERATION_FAILED.test(e.message)) || e.status === 401 || e.status === 403 || e.status === 404
   || e.status === 408 || e.status === 409 || e.status === 413 || e.status === 429 || e.status >= 500
   || (e.status === 400 && TOO_LONG.test(e.message));
 // 401/403/429 are about one key: its siblings may still work. The rest condemns the target.
@@ -663,7 +734,7 @@ function cacheSet(k, v) {
 }
 
 // ---------- stats ----------
-const stats = { requests: 0, cacheHits: 0, fallbacks: 0, failures: 0, tokens: { prompt: 0, completion: 0 } };
+const stats = { requests: 0, cacheHits: 0, fallbacks: 0, hedges: 0, failures: 0, tokens: { prompt: 0, completion: 0 } };
 const addUsage = (u) => { if (u) { stats.tokens.prompt += u.prompt_tokens || 0; stats.tokens.completion += u.completion_tokens || 0; } };
 
 // ---------- routing ----------
@@ -715,12 +786,56 @@ async function route(res, body, { endpoint, requested, cacheable }) {
     share = (out) => { inflight.delete(ck); resolveShare(out); };
   }
   try {
-    const out = await attempt(res, body, { endpoint, requested, targets, ck, t0 });
+    const combo = Object.hasOwn(cfg.combos || {}, requested) ? cfg.combos[requested] : cfg.combos?.[aliasFor(requested)];
+    const own = combo && !Array.isArray(combo) ? combo.hedgeMs : undefined;
+    const hedgeMs = Number(own ?? cfg.hedgeMs) || 0;
+    const out = await attempt(res, body, { endpoint, requested, targets, ck, t0, hedgeMs });
     share?.(out);
   } catch (e) { share?.(null); throw e; }
 }
 
-async function attempt(res, body, { endpoint, requested, targets: allTargets, ck, t0 }) {
+// Hedged call: if the first target has not answered within hedgeMs, the next one is started in
+// parallel and the first to answer wins; the other is cancelled. Cuts the tail latency of a slow
+// or overloaded provider at the price of an occasional duplicate call.
+async function hedgedCall(a, b, body, signal, endpoint, hedgeMs) {
+  const start = (pair) => {
+    const ctl = new AbortController();
+    const relay = () => ctl.abort();
+    signal.addEventListener('abort', relay, { once: true });
+    const p = callOnce(pair.t, pair.k, body, ctl.signal, endpoint)
+      .then((up) => ({ pair, up }), (error) => ({ pair, error }))
+      .finally(() => signal.removeEventListener('abort', relay));
+    return { pair, p, ctl };
+  };
+  const A = start(a);
+  let timer;
+  const fired = new Promise((r) => { timer = setTimeout(r, hedgeMs); });
+  const first = await Promise.race([A.p, fired.then(() => null)]);
+  if (first) { clearTimeout(timer); return { ...first, others: [] }; }
+  stats.hedges++;
+  const B = start(b);
+  const racers = [A, B];
+  const failures = [];
+  // First success wins; a failure just waits for the other racer.
+  const pending = new Set(racers);
+  while (pending.size) {
+    const r = await Promise.race([...pending].map((x) => x.p.then((v) => ({ x, v }))));
+    pending.delete(r.x);
+    if (r.v.up) {
+      for (const other of pending) {
+        other.ctl.abort();
+        other.p.then((o) => o.up?.cleanup()); // it may still resolve after the abort
+      }
+      return { pair: r.v.pair, up: r.v.up, others: failures };
+    }
+    failures.push(r.v);
+  }
+  // Both failed: report the primary's error, the secondary's one on the side.
+  const primary = failures.find((f) => f.pair === a) || failures[0];
+  return { pair: primary.pair, error: primary.error, others: failures.filter((f) => f !== primary) };
+}
+
+async function attempt(res, body, { endpoint, requested, targets: allTargets, ck, t0, hedgeMs = 0 }) {
   let targets = allTargets;
   const clientAbort = new AbortController();
   res.on('close', () => { if (!res.writableFinished) clientAbort.abort(); });
@@ -746,20 +861,47 @@ async function attempt(res, body, { endpoint, requested, targets: allTargets, ck
     ready.sort((a, b) => (coolUntil(a) > now) - (coolUntil(b) > now));
     const deadTargets = new Set();
 
-    for (const { t, k } of ready) {
-      if (deadTargets.has(t.id) || permanent.has(t.id)) continue;
+    const tried = new Set();
+    // Secondary failures from a hedged call are recorded like any other, without answering the client.
+    const note = (t, k, e) => {
+      const status = e instanceof Upstream ? normalise(e.status, String(e.message)) : 0;
+      if (clientAbort.signal.aborted || String(e.message) === 'client aborted') return;
+      errors.push(`${t.id}: ${status || 'ERR'} ${String(e.message).slice(0, 160)}`);
+      cooldown(k.hid, status, e.retryAfter);
+      if (e.rpm) h(k.hid).learnedRpm = e.rpm;
+      const miss = capabilityMiss(status, String(e.message), need);
+      if (miss) { lacksFor(t.id).add(miss); permanent.add(t.id); }
+      else if (status === 400 && GENERATION_FAILED.test(String(e.message))) { h(k.hid).until = 0; deadTargets.add(t.id); }
+      else if (status === 404 || status === 400 || status === 413) permanent.add(t.id);
+      else if (!keyLevel({ status })) deadTargets.add(t.id);
+    };
+    for (let i = 0; i < ready.length; i++) {
+      let { t, k } = ready[i];
+      if (deadTargets.has(t.id) || permanent.has(t.id) || tried.has(k.hid)) continue;
       if (clientAbort.signal.aborted) return null;
       if (tries++) stats.fallbacks++;
       h(k.hid).calls.push(Date.now());
-      const head = { 'x-bascule-target': t.id };
       let up;
       try {
-        up = await callOnce(t, k, body, clientAbort.signal, endpoint);
+        const next = hedgeMs > 0 && ready.slice(i + 1).find((p) => p.t.id !== t.id && !deadTargets.has(p.t.id)
+          && !permanent.has(p.t.id) && !tried.has(p.k.hid));
+        if (next) {
+          const r = await hedgedCall({ t, k }, next, body, clientAbort.signal, endpoint, hedgeMs);
+          tried.add(k.hid); tried.add(next.k.hid);
+          for (const o of r.others) note(o.pair.t, o.pair.k, o.error);
+          ({ t, k } = r.pair);
+          if (r.error) throw r.error;
+          up = r.up;
+          if (t !== ready[i].t) { tries++; stats.fallbacks++; }
+        } else up = await callOnce(t, k, body, clientAbort.signal, endpoint);
         let out = null;
+        const head = { 'x-bascule-target': t.id };
         if (body.stream) await pipeStream(up, t, res, head, requested);
         else {
           const raw = await readJson(up.reader);
           out = t.provider.type === 'anthropic' ? fromAnthropic(raw, t.model) : raw;
+          const m = out?.choices?.[0]?.message;
+          if (endpoint === '/chat/completions' && !m?.content && !m?.tool_calls?.length) throw new Upstream(502, 'empty answer');
           addUsage(out.usage);
           if (ck) cacheSet(ck, out);
           send(res, 200, shape(res, out, requested), head);
@@ -794,7 +936,8 @@ async function attempt(res, body, { endpoint, requested, targets: allTargets, ck
           return null;
         }
         lastStatus = status === 429 ? 429 : 503;
-        if (status === 404 || status === 400 || status === 413) permanent.add(t.id);
+        if (status === 400 && GENERATION_FAILED.test(String(e.message))) { h(k.hid).until = 0; h(k.hid).fails = 0; deadTargets.add(t.id); }
+        else if (status === 404 || status === 400 || status === 413) permanent.add(t.id);
         else if (!keyLevel({ status })) deadTargets.add(t.id);
       } finally { up?.cleanup(); }
     }
@@ -1064,6 +1207,7 @@ for (const sig of ['SIGINT', 'SIGTERM']) process.on(sig, shutdown);
 process.on('SIGHUP', () => reload('SIGHUP'));
 loadState();
 setInterval(saveState, 30_000).unref();
+warmUp();
 // Editors save in bursts (truncate, write, rename): wait for the file to settle before reloading.
 let reloadTimer;
 for (const f of [CONFIG_PATH, ENV_PATH].filter(Boolean)) {

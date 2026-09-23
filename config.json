@@ -5,6 +5,7 @@
   "firstByteTimeoutMs": 30000,
   "idleTimeoutMs": 60000,
   "maxWaitMs": 20000,
+  "hedgeMs": 0,
   "compactWhitespace": true,
   "cache": { "maxEntries": 500, "ttlMs": 600000, "always": false },
   "corsOrigins": [],
@@ -34,11 +35,12 @@
   },
 
   "combos": {
-    "auto":  ["groq/openai/gpt-oss-120b", "cerebras/gpt-oss-120b", "gemini/gemini-3.5-flash-lite",
-              "openrouter/openrouter/free", "mistral/mistral-small-latest", "deepseek/deepseek-flash", "ollama/qwen2.5:3b"],
-    "fast":  { "strategy": "fastest", "targets": ["groq/openai/gpt-oss-20b", "cerebras/gpt-oss-120b", "gemini/gemini-3.5-flash-lite"] },
+    "auto":  { "hedgeMs": 3000, "targets": ["groq/openai/gpt-oss-120b", "cerebras/gpt-oss-120b", "gemini/gemini-3.5-flash-lite",
+              "openrouter/qwen/qwen3.8-27b:free", "openrouter/google/gemma-4-31b-it:free", "mistral/mistral-small-latest", "deepseek/deepseek-flash", "ollama/qwen2.5:3b"] },
+    "fast":  { "strategy": "fastest", "hedgeMs": 1000, "targets": ["groq/openai/gpt-oss-20b", "cerebras/gpt-oss-120b", "gemini/gemini-3.5-flash-lite",
+              "openrouter/google/gemma-4-31b-it:free"] },
     "smart": ["anthropic/claude-sonnet-5", "gemini/gemini-3.8-flash", "openai/gpt-6-sol", "deepseek/deepseek-v4-pro",
-              "openrouter/openrouter/free", "groq/openai/gpt-oss-120b", "gemini/gemini-3.5-flash-lite"],
+              "openrouter/qwen/qwen3.8-27b:free", "groq/openai/gpt-oss-120b", "gemini/gemini-3.5-flash-lite", "openrouter/google/gemma-4-31b-it:free"],
     "local": ["ollama/qwen2.5:3b"]
   }
 }

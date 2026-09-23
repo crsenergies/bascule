@@ -17,9 +17,12 @@ const seen = {};
 const servers = [];
 
 // A mock provider: counts hits, remembers the last body and auth, delegates the answer.
-async function mock(name, answer) {
-  hits[name] = 0;
+// GET requests (bascule's connection warm-up, doctor's model listing) are answered apart and not counted.
+const warmups = {};
+async function mock(name, answer, onGet = (req, res) => json(res, { object: 'list', data: [] })) {
+  hits[name] = 0; warmups[name] = 0;
   const s = await listen(async (req, res) => {
+    if (req.method === 'GET') { warmups[name]++; return onGet(req, res); }
     hits[name]++;
     const body = await readJson(req);
     seen[name] = { body, auth: req.headers.authorization || req.headers['x-api-key'], path: req.url };
@@ -36,7 +39,6 @@ const sse = (res) => { res.writeHead(200, { 'content-type': 'text/event-stream' 
 
 // ---------- mock providers ----------
 const echo = await mock('echo', (req, res, body) => {
-  if (req.method === 'GET' && req.url.endsWith('/models')) return json(res, { object: 'list', data: [{ id: 'models/m' }, { id: 'only-here' }] });
   if (req.url.endsWith('/embeddings')) return json(res, { object: 'list', data: [{ embedding: [0.1, 0.2] }], model: body.model });
   const last = body.messages.at(-1);
   if (body.tools && last.role === 'user' && String(last.content).includes('use the tool')) {
@@ -58,16 +60,25 @@ const echo = await mock('echo', (req, res, body) => {
   // Nested usage details: a naive regex would stop at the first closing brace.
   w({ choices: [], usage: { prompt_tokens: 3, completion_tokens: 2, total_tokens: 5, prompt_tokens_details: { cached_tokens: 0 } } });
   res.end('data: [DONE]\n\n');
-});
+}, (req, res) => json(res, { object: 'list', data: [{ id: 'models/m' }, { id: 'only-here' }] }));
 const limited = await mock('limited', (req, res) => { res.writeHead(429, { 'retry-after': '60' }); res.end('rate limited'); });
 const limitedDate = await mock('limitedDate', (req, res) => { res.writeHead(429, { 'retry-after': new Date(Date.now() + 90_000).toUTCString() }); res.end('slow down'); });
 const badKey = await mock('badKey', (req, res) => (req.headers.authorization === 'Bearer good' ? json(res, completion('second key')) : json(res, { error: 'bad key' }, 401)));
-const badKey400 = await mock('badKey400', (req, res) => (req.headers.authorization === 'Bearer good' ? json(res, completion('ok after 400 key')) : json(res, [{ error: { code: 400, message: 'Please pass a valid API key', status: 'INVALID_ARGUMENT' } }], 400)));
+const invalidKey400 = (req, res) => json(res, [{ error: { code: 400, message: 'Please pass a valid API key', status: 'INVALID_ARGUMENT' } }], 400);
+const badKey400 = await mock('badKey400', (req, res) => (req.headers.authorization === 'Bearer good' ? json(res, completion('ok after 400 key')) : invalidKey400(req, res)), invalidKey400);
 const broken = await mock('broken', (req, res) => json(res, { error: 'boom' }, 500));
 const badReq = await mock('badReq', (req, res) => json(res, { error: { message: 'temperature must be a number' } }, 400));
 const tooLong = await mock('tooLong', (req, res) => json(res, { error: { message: "This model's maximum context length is 8192 tokens" } }, 400));
 const tooBig = await mock('tooBig', (req, res) => json(res, { error: 'payload too large' }, 413));
 const streamErr = await mock('streamErr', (req, res) => { const w = sse(res); w({ error: { message: 'quota exceeded', code: 429 } }); res.end(); });
+// Groq-style: a content-free first chunk, then the error in the stream.
+const lateErr = await mock('lateErr', (req, res) => { const w = sse(res); w({ choices: [{ index: 0, delta: { role: 'assistant' } }] });
+  w({ error: { message: "Tool call validation failed: attempted to call tool 'metéo'", type: 'invalid_request_error', code: 'tool_use_failed' } }); res.end(); });
+const toolFail = await mock('toolFail', (req, res) => json(res, { error: { message: 'Failed to call a function. Please adjust your prompt.', type: 'invalid_request_error', code: 'tool_use_failed' } }, 400));
+const blank = await mock('blank', (req, res, body) => {
+  if (!body.stream) return json(res, completion(''));
+  const w = sse(res); w({ choices: [{ index: 0, delta: { role: 'assistant', content: '' } }] }); w({ choices: [{ index: 0, delta: {}, finish_reason: 'stop' }] }); res.end('data: [DONE]\n\n');
+});
 const streamEmpty = await mock('streamEmpty', (req, res) => { res.writeHead(200, { 'content-type': 'text/event-stream' }); res.end(); });
 const streamCut = await mock('streamCut', (req, res) => { const w = sse(res); w({ choices: [{ index: 0, delta: { content: 'par' } }] }); setTimeout(() => res.destroy(), 50); });
 const streamStall = await mock('streamStall', (req, res) => { const w = sse(res); w({ choices: [{ index: 0, delta: { content: 'a' } }] }); });
@@ -94,6 +105,8 @@ const textOnly = await mock('textOnly', (req, res, body) => (body.messages.some(
 const noTools = await mock('noTools', (req, res, body) => (body.tools
   ? json(res, { error: { message: 'registry.ollama.ai/library/m does not support tools' } }, 400)
   : json(res, completion('no tools here'))));
+let slowClosed = 0;
+const tortoise = await mock('tortoise', async (req, res) => { res.on('close', () => { if (!res.writableFinished) slowClosed++; }); await sleep(250); if (!res.destroyed) json(res, completion('tortoise')); });
 const fast = await mock('fast', (req, res) => json(res, completion('fast')));
 const slow = await mock('slow', async (req, res) => { await sleep(150); json(res, completion('slow')); });
 
@@ -143,18 +156,19 @@ writeFileSync(join(dir, 'config.json'), JSON.stringify({
   providers: {
     echo: P(echo, { models: ['m', 'only-here'] }), limited: P(limited, { keys: ['k1', 'k2'] }), limitedDate: P(limitedDate),
     badKey: P(badKey, { keys: ['bad', 'good'] }), badKey400: P(badKey400, { keys: ['bad', 'good'] }), broken: P(broken, { keys: ['k1', 'k2', 'k3'] }), badReq: P(badReq), tooLong: P(tooLong),
-    tooBig: P(tooBig), streamErr: P(streamErr), streamEmpty: P(streamEmpty), streamCut: P(streamCut), streamStall: P(streamStall),
-    silent: P(silent), flaky429: P(flaky429), shared: P(shared), budget: P(budget, { rpm: 2 }), quota: P(quota), slowBody: P(slowBody), garbage: P(garbage), hang: P(hang), fast: P(fast), slow: P(slow), fresh: P(fast), tuned: P(fast, { minMaxTokens: 1024, params: { reasoning_effort: 'low' } }), textOnly: P(textOnly), noTools: P(noTools),
+    tooBig: P(tooBig), streamErr: P(streamErr), streamEmpty: P(streamEmpty), blank: P(blank), lateErr: P(lateErr), toolFail: P(toolFail), streamCut: P(streamCut), streamStall: P(streamStall),
+    silent: P(silent), flaky429: P(flaky429), shared: P(shared), budget: P(budget, { rpm: 2 }), quota: P(quota), slowBody: P(slowBody), garbage: P(garbage), hang: P(hang), fast: P(fast), slow: P(slow), tortoise: P(tortoise), fresh: P(fast), tuned: P(fast, { minMaxTokens: 1024, params: { reasoning_effort: 'low' } }), textOnly: P(textOnly), noTools: P(noTools),
     an: P(anthropic, { type: 'anthropic', keys: ['ak'], models: ['claude'] }), anCrlf: P(anthropicCrlf, { type: 'anthropic' }), anErr: P(anthropicErr, { type: 'anthropic' }),
     off: { baseUrl: 'http://127.0.0.1:1', keys: ['${UNSET_VAR}'], models: ['x'] },
   },
   combos: {
     auto: ['limited/m', 'echo/m'], smart: ['echo/m'], quick: ['fast/m'], dated: ['limitedDate/m', 'echo/m'], keys: ['badKey/m'], keys400: ['badKey400/m'], dead: ['broken/m', 'echo/m'],
     badreq: ['badReq/m', 'echo/m'], toolong: ['tooLong/m', 'echo/m'], toobig: ['tooBig/m', 'echo/m'],
-    serr: ['streamErr/m', 'echo/m'], sempty: ['streamEmpty/m', 'echo/m'], scut: ['streamCut/m', 'echo/m'], sstall: ['streamStall/m'],
+    serr: ['streamErr/m', 'echo/m'], sempty: ['streamEmpty/m', 'echo/m'], blank: ['blank/m', 'echo/m'], late: ['lateErr/m', 'echo/m'], toolfail: ['toolFail/m', 'echo/m'], scut: ['streamCut/m', 'echo/m'], sstall: ['streamStall/m'],
     silent: ['silent/m', 'echo/m'], slowbody: ['slowBody/m', 'echo/m'], garbage: ['garbage/m', 'echo/m'], hang: ['hang/m'],
     claude: ['an/claude'], crlf: ['anCrlf/m'], anerr: ['anErr/m', 'echo/m'], allfail: ['broken/m'], all429: ['limited/m'], emb: ['an/claude', 'echo/m'],
-    flaky: ['flaky429/m'], vision: ['textOnly/m', 'echo/m'], visionNone: ['textOnly/m'], toolsc: ['noTools/m', 'echo/m'], budgeted: ['budget/m', 'echo/m'], learn: ['quota/m', 'echo/m'], rr: { strategy: 'round-robin', targets: ['fast/m', 'slow/m'] }, fastest: { strategy: 'fastest', targets: ['slow/m', 'fast/m'] },
+    flaky: ['flaky429/m'], hedge: { targets: ['tortoise/m', 'fast/m'], hedgeMs: 60 }, nohedge: ['tortoise/m', 'fast/m'],
+    hedgeFail: { targets: ['broken/m', 'tortoise/m'], hedgeMs: 60 }, hedgeStream: { targets: ['tortoise/m', 'echo/m'], hedgeMs: 60 }, vision: ['textOnly/m', 'echo/m'], visionNone: ['textOnly/m'], toolsc: ['noTools/m', 'echo/m'], budgeted: ['budget/m', 'echo/m'], learn: ['quota/m', 'echo/m'], rr: { strategy: 'round-robin', targets: ['fast/m', 'slow/m'] }, fastest: { strategy: 'fastest', targets: ['slow/m', 'fast/m'] },
     explore: { strategy: 'fastest', targets: ['slow/m', 'fast/m', 'fresh/m'] },
   },
 }));
@@ -209,6 +223,10 @@ try {
   });
   await test('unknown path gives 404', async () => assert.equal((await get('/v1/nothing')).status, 404));
   await test('paths without /v1 also work', async () => assert.equal((await post({ model: 'echo/m', messages: msg() }, {}, '/chat/completions')).status, 200));
+
+  await test('connections to providers are warmed up at start', async () => {
+    assert.ok(warmups.echo >= 1 && warmups.anthropic >= 1, JSON.stringify(warmups));
+  });
 
   console.log('routing & fallback');
   await test('429 on both keys falls back to next target', async () => {
@@ -342,6 +360,31 @@ try {
     assert.equal(seen.fast.body.max_tokens, 50, 'untuned provider keeps the client value');
     assert.ok(!('reasoning_effort' in seen.fast.body));
   });
+  await test('hedged call: slow primary, fast backup wins, loser is cancelled', async () => {
+    const t0 = Date.now(), before = slowClosed;
+    const r = await post({ model: 'hedge', messages: msg() });
+    assert.equal(r.headers.get('x-bascule-target'), 'fast/m');
+    assert.ok(Date.now() - t0 < 220, `took ${Date.now() - t0} ms`);
+    await sleep(100);
+    assert.equal(slowClosed, before + 1, 'slow upstream request must be aborted');
+    assert.ok((await stats()).hedges >= 1);
+  });
+  await test('without hedging the slow primary is awaited', async () => {
+    const r = await post({ model: 'nohedge', messages: msg() });
+    assert.equal(r.headers.get('x-bascule-target'), 'tortoise/m');
+  });
+  await test('hedged call: fast failure of primary still falls back normally', async () => {
+    const r = await post({ model: 'hedgeFail', messages: msg() });
+    assert.equal(r.status, 200);
+    assert.equal(r.headers.get('x-bascule-target'), 'tortoise/m');
+  });
+  await test('hedged streams work', async () => {
+    const r = await post({ model: 'hedgeStream', stream: true, messages: msg() });
+    assert.equal(r.headers.get('x-bascule-target'), 'echo/m');
+    const txt = await r.text();
+    assert.equal(events(txt).map((c) => c.choices[0]?.delta?.content || '').join(''), 'Bonjour');
+    assert.ok(txt.endsWith('data: [DONE]\n\n'));
+  });
   await test('bare model name resolves to its provider', async () => {
     const r = await post({ model: 'only-here', messages: msg() });
     assert.equal(r.headers.get('x-bascule-target'), 'echo/only-here');
@@ -394,6 +437,25 @@ try {
   });
   await test('error inside a 200 stream falls back', async () => {
     const r = await post({ model: 'serr', stream: true, messages: msg() });
+    assert.equal(r.headers.get('x-bascule-target'), 'echo/m');
+    assert.ok((await r.text()).includes('Bon'));
+  });
+  await test('in-stream error after a content-free chunk still falls back', async () => {
+    const r = await post({ model: 'late', stream: true, messages: msg() });
+    assert.equal(r.headers.get('x-bascule-target'), 'echo/m');
+    const txt = await r.text();
+    assert.ok(!txt.includes('tool_use_failed') && txt.includes('Bon'));
+  });
+  await test('provider-rejected tool call (400 tool_use_failed) tries the next model', async () => {
+    const r = await post({ model: 'toolfail', messages: msg() });
+    assert.equal(r.status, 200);
+    assert.equal(r.headers.get('x-bascule-target'), 'echo/m');
+    assert.ok(!(await stats()).cannot['toolFail/m'], 'not learned as a capability gap');
+  });
+  await test('empty answer (no text, no tool call) falls back, plain and stream', async () => {
+    let r = await post({ model: 'blank', messages: msg('b') });
+    assert.equal(r.headers.get('x-bascule-target'), 'echo/m');
+    r = await post({ model: 'blank', stream: true, messages: msg('b') });
     assert.equal(r.headers.get('x-bascule-target'), 'echo/m');
     assert.ok((await r.text()).includes('Bon'));
   });

@@ -40,6 +40,10 @@ client.chat.completions.create(model="auto", messages=[{"role": "user", "content
 - Rate limits: when every target is only rate limited and one frees up within `maxWaitMs` (default 20 s), the request waits instead of failing. Otherwise it returns 429 with `retry-after`, which OpenAI SDKs honour.
 - Per-minute budgets: set `rpm` on a provider, or let bascule learn it from a 429 that states the quota (Gemini does). A target at its budget is skipped without calling it, so no quota is burnt on requests that could only fail.
 - Identical concurrent `temperature: 0` requests share a single upstream call.
+- Speed: upstream connections are kept alive and warmed up at start, which saves the 100-200 ms TLS handshake Node's `fetch` pays after 4 s of idle (measured: 170-190 ms less per request on Groq and Gemini). Combos can hedge: with `hedgeMs`, if the first target has not answered in time, the next one starts in parallel and the first answer wins (on by default for `auto`, 3 s, and `fast`, 1 s). bascule itself adds about 0.3 ms per request.
+- Anthropic Messages API (`POST /v1/messages`, `/v1/messages/count_tokens`): Claude Code and the Anthropic SDKs work with any provider. Set `ANTHROPIC_BASE_URL=http://127.0.0.1:20129`. `aliases` map names such as `claude-*` onto combos.
+- Empty answers, in-stream errors after a content-free first chunk, and tool calls rejected by the provider (Groq's `tool_use_failed`) all fall back to the next target.
+- Per-provider `minMaxTokens` stops reasoning models from spending a small `max_tokens` on thinking and returning nothing; `params` adds provider-specific fields without overriding the client's.
 - Capability learning: when a model rejects images or tools, the request moves to the next model, and bascule remembers the gap so later image or tool requests skip that model while text requests still use it. What it learns (capability gaps, per-minute quotas) is kept in `~/.bascule/state.json` across restarts.
 - Text-only content arrays are sent as plain strings, for APIs such as Groq that accept nothing else.
 - Combo strategies: `priority` (default), `fastest` (measured latency), `round-robin`.
@@ -80,7 +84,7 @@ bascule routes between accounts and keys you are entitled to use. Respect each p
 ## Tests
 
 ```bash
-node test.mjs   # 80 end-to-end tests against mock providers, no network, no keys
+node test.mjs   # 100 end-to-end tests against mock providers, no network, no keys
 ```
 
 They cover fallback for every error class, key rotation, timeouts, streaming failures, the Anthropic translation, the security guards, 300 concurrent requests, memory growth over 3,000 requests, and the command line.
@@ -94,6 +98,7 @@ Une seule adresse locale, compatible OpenAI, devant tous tes fournisseurs d'IA. 
 1. Installer Node.js 20+, puis `npm install -g bascule`.
 2. `bascule init`, puis mettre tes clés API dans `~/.bascule/.env`.
 3. `bascule doctor` pour vérifier que tes clés marchent.
+   Pour Claude Code : `ANTHROPIC_BASE_URL=http://127.0.0.1:20129 claude`.
 4. `bascule`, puis régler tes outils sur `http://127.0.0.1:20129/v1` avec le modèle `auto`. `bascule status` montre ce qui se passe.
 
 Utilise seulement des comptes et des clés auxquels tu as droit : pas de comptes gratuits multiples, pas d'abonnement grand public utilisé comme clé API.
