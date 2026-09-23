@@ -6,6 +6,7 @@ import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 
 const SERVER = join(dirname(fileURLToPath(import.meta.url)), 'server.mjs');
 const listen = (handler) => new Promise((ok) => { const s = http.createServer(handler); s.listen(0, '127.0.0.1', () => ok(s)); });
@@ -206,6 +207,28 @@ try {
   await test('key of a different length is refused', async () => assert.equal((await post({ model: 'auto', messages: msg() }, { authorization: 'Bearer secretsecret' })).status, 401));
   await test('x-api-key header is accepted', async () => assert.equal((await post({ model: 'echo/m', messages: msg() }, { authorization: '', 'x-api-key': 'secret' })).status, 200));
   await test('/health needs no key', async () => assert.equal((await fetch(base + '/health')).status, 200));
+  await test('dashboard page is served without a key, locked down by CSP', async () => {
+    const r = await fetch(base + '/');
+    assert.equal(r.status, 200);
+    assert.match(r.headers.get('content-type'), /text\/html/);
+    const csp = r.headers.get('content-security-policy');
+    assert.match(csp, /default-src 'none'/);
+    assert.match(csp, /script-src 'sha256-/);
+    assert.ok(!/unsafe-inline/.test(csp));
+    assert.match(await r.text(), /<title>bascule<\/title>/);
+  });
+  await test('dashboard data still needs the key', async () => assert.equal((await fetch(base + '/stats')).status, 401));
+  await test('dashboard CSP hashes match the inline script and style', async () => {
+    const r = await fetch(base + '/dashboard');
+    const html = await r.text(), csp = r.headers.get('content-security-policy');
+    const hash = (s) => `'sha256-${createHash('sha256').update(s).digest('base64')}'`;
+    assert.ok(csp.includes(hash(html.match(/<script>([\s\S]*)<\/script>/)[1])), 'script hash');
+    assert.ok(csp.includes(hash(html.match(/<style>([\s\S]*)<\/style>/)[1])), 'style hash');
+  });
+  await test('stats list each combo with its resolved targets', async () => {
+    const st = await stats();
+    assert.deepEqual(st.combos.hedge, ['tortoise/m', 'fast/m']);
+  });
   await test('bad JSON gives 400', async () => assert.equal((await post('{nope')).status, 400));
   await test('JSON that is not an object gives 400', async () => assert.equal((await post('[1,2]')).status, 400));
   await test('empty messages give 400', async () => assert.equal((await post({ model: 'auto', messages: [] })).status, 400));

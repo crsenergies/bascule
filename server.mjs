@@ -8,6 +8,7 @@ import { createHash, timingSafeEqual, randomBytes } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 import { homedir } from 'node:os';
+import { spawn } from 'node:child_process';
 
 const ROOT = dirname(fileURLToPath(import.meta.url));
 const HOME_DIR = process.env.BASCULE_HOME || join(homedir(), '.bascule');
@@ -23,6 +24,7 @@ if (arg === '--help' || arg === '-h') {
   bascule           start the router (default http://127.0.0.1:20129/v1)
   bascule doctor    check every configured key and model (add --deep to send a tiny real request)
   bascule status    show live stats of the running router
+  bascule dashboard open the live dashboard of the running router in the browser
 
 Config and keys are reloaded automatically when their files change (or on SIGHUP).
 
@@ -41,7 +43,7 @@ if (arg === 'init') {
   console.log(`config: ${cfgOut}\nkeys:   ${envOut}  (add your provider API keys, then run: bascule)`);
   process.exit(0);
 }
-if (arg && !['doctor', 'status'].includes(arg)) { console.error(`unknown argument "${arg}" (try --help)`); process.exit(2); }
+if (arg && !['doctor', 'status', 'dashboard'].includes(arg)) { console.error(`unknown argument "${arg}" (try --help)`); process.exit(2); }
 
 // ---------- config ----------
 // Variables already set in the real environment win over the file. Those that came from the
@@ -1009,8 +1011,10 @@ function status() {
     coolingForS: s.until > now ? Math.ceil((s.until - now) / 1000) : 0, ...(s.learnedRpm && { learnedRpm: s.learnedRpm }),
     ...(s.maxTokens && { maxTokens: s.maxTokens }) };
   const cannot = Object.fromEntries([...lacks].filter(([, c]) => c.size).map(([id, c]) => [id, [...c]]));
+  const combos = Object.fromEntries(Object.entries(cfg.combos || {}).map(([name, c]) =>
+    [name, (Array.isArray(c) ? c : c.targets || []).map((t) => parseTarget(t)?.id).filter(Boolean)]));
   return { version: VERSION, uptimeS: Math.round(process.uptime()), providers: Object.keys(providers), cannot,
-    cacheSize: cache.size, ...stats, targets };
+    cacheSize: cache.size, ...stats, combos, targets };
 }
 
 function log(code, model, target, t0, fallbacks) {
@@ -1102,8 +1106,13 @@ async function doctor(deep) {
   return working;
 }
 
+const localBase = () => {
+  const host = HOST === '0.0.0.0' ? '127.0.0.1' : HOST === '::' ? '::1' : HOST;
+  return `http://${host.includes(':') ? `[${host}]` : host}:${PORT}`;
+};
+
 async function printStatus() {
-  const url = `http://${HOST.includes(':') ? `[${HOST}]` : HOST}:${PORT}/stats`;
+  const url = `${localBase()}/stats`;
   let st;
   try {
     const r = await fetch(url, { headers: API_KEY ? { authorization: `Bearer ${API_KEY}` } : {}, signal: AbortSignal.timeout(5000) });
@@ -1128,6 +1137,171 @@ const ENDPOINTS = { '/v1/chat/completions': '/chat/completions', '/v1/embeddings
 
 if (arg === 'doctor') process.exit((await doctor(process.argv.includes('--deep'))) ? 0 : 1);
 if (arg === 'status') process.exit((await printStatus()) ? 0 : 1);
+// The key rides in the URL fragment, which browsers never send to the server; the page moves it
+// to localStorage and wipes it from the address bar.
+if (arg === 'dashboard') {
+  try { await fetch(`${localBase()}/health`, { signal: AbortSignal.timeout(5000) }); }
+  catch (e) { console.error(`no router answering on ${localBase()} (${e.cause?.code || e.message}). Start it with: bascule`); process.exit(1); }
+  const url = `${localBase()}/${API_KEY ? `#key=${encodeURIComponent(API_KEY)}` : ''}`;
+  const [cmd, args] = process.platform === 'darwin' ? ['open', [url]] : process.platform === 'win32' ? ['cmd', ['/c', 'start', '', url]] : ['xdg-open', [url]];
+  spawn(cmd, args, { stdio: 'ignore', detached: true }).on('error', () => {}).unref();
+  console.log(`dashboard: ${localBase()}/`);
+  process.exit(0);
+}
+
+// ---------- dashboard ----------
+// One self-contained page, no external assets. The strict CSP pins the inline style and script by hash.
+const DASHBOARD_CSS = `
+:root { color-scheme: light dark; --bg: #f6f6f4; --card: #fff; --line: #e2e2dc; --text: #1d1d1b; --dim: #74746c;
+  --ok: #1f8a4c; --warn: #b7791f; --bad: #c53030; --idle: #a0a09a; }
+@media (prefers-color-scheme: dark) { :root { --bg: #151514; --card: #1f1f1d; --line: #33332f; --text: #ecece6; --dim: #9a9a92; --idle: #5c5c56; } }
+* { box-sizing: border-box; }
+body { margin: 0; font: 14px/1.45 system-ui, -apple-system, sans-serif; background: var(--bg); color: var(--text); }
+main { max-width: 980px; margin: 0 auto; padding: 24px 16px 48px; }
+header { display: flex; align-items: baseline; gap: 12px; flex-wrap: wrap; margin-bottom: 20px; }
+h1 { font-size: 22px; margin: 0; }
+h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .06em; color: var(--dim); margin: 28px 0 10px; }
+.dim { color: var(--dim); }
+.live::before { content: ""; display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: var(--ok); margin-right: 6px; }
+.live.down::before { background: var(--bad); }
+.grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(118px, 1fr)); gap: 10px; }
+.card { background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 12px 14px; }
+.card b { display: block; font-size: 22px; font-variant-numeric: tabular-nums; }
+.combo { background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 10px 14px; margin-bottom: 8px;
+  display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
+.combo > strong { min-width: 70px; }
+.chip { border-radius: 999px; padding: 2px 10px; font-size: 12px; border: 1px solid var(--line); }
+.chip::before, td.st::before { content: ""; display: inline-block; width: 7px; height: 7px; border-radius: 50%; margin-right: 6px; background: var(--idle); }
+.ready::before { background: var(--ok) !important; } .cooling::before { background: var(--warn) !important; } .failing::before { background: var(--bad) !important; }
+.arrow { color: var(--dim); }
+table { width: 100%; border-collapse: collapse; background: var(--card); border: 1px solid var(--line); border-radius: 10px; overflow: hidden; }
+th, td { text-align: left; padding: 7px 12px; border-bottom: 1px solid var(--line); font-variant-numeric: tabular-nums; }
+th { font-weight: 600; color: var(--dim); font-size: 12px; }
+tr:last-child td { border-bottom: 0; }
+td.num, th.num { text-align: right; }
+form { background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 16px; display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+input { flex: 1; min-width: 220px; padding: 8px 10px; border: 1px solid var(--line); border-radius: 6px; background: var(--bg); color: var(--text); font: inherit; }
+button { padding: 8px 14px; border: 0; border-radius: 6px; background: var(--text); color: var(--bg); font: inherit; cursor: pointer; }
+.msg { width: 100%; color: var(--bad); margin: 0; }
+[hidden] { display: none !important; }
+`;
+const DASHBOARD_JS = `
+const T = {
+  en: { requests: 'Requests', fallbacks: 'Fallbacks', failures: 'Failures', cacheHits: 'Cache hits', hedges: 'Hedged',
+    tokensIn: 'Tokens in', tokensOut: 'Tokens out', combos: 'Combos (tried in this order)', targets: 'Targets', target: 'Target',
+    state: 'State', latency: 'Latency', limit: 'Limit', ready: 'ready', cooling: 'pausing', failing: 'failing', idle: 'not used yet',
+    up: 'up', live: 'live', offline: 'router not reachable', key: 'Access key (BASCULE_KEY in ~/.bascule/.env)', save: 'Open',
+    badKey: 'Wrong key.', lacks: 'no ', none: 'No target used yet. Send a request to see it here.', perMin: '/min' },
+  fr: { requests: 'Requêtes', fallbacks: 'Bascules', failures: 'Échecs', cacheHits: 'Cache', hedges: 'Doublées',
+    tokensIn: 'Tokens entrée', tokensOut: 'Tokens sortie', combos: 'Combos (essayés dans cet ordre)', targets: 'Modèles', target: 'Modèle',
+    state: 'État', latency: 'Latence', limit: 'Limite', ready: 'prêt', cooling: 'en pause', failing: 'en échec', idle: 'pas encore utilisé',
+    up: 'actif depuis', live: 'en direct', offline: 'routeur injoignable', key: 'Clé d’accès (BASCULE_KEY dans ~/.bascule/.env)', save: 'Ouvrir',
+    badKey: 'Mauvaise clé.', lacks: 'sans ', none: 'Aucun modèle utilisé. Envoie une requête pour le voir ici.', perMin: '/min' },
+};
+const L = T[(navigator.language || 'en').slice(0, 2)] || T.en;
+const $ = (id) => document.getElementById(id);
+const el = (tag, cls, ...kids) => { const e = document.createElement(tag); if (cls) e.className = cls; e.append(...kids.map((k) => k instanceof Node ? k : String(k))); return e; };
+const fmt = (n) => Number(n || 0).toLocaleString();
+const dur = (s) => s >= 86400 ? Math.floor(s / 86400) + 'd ' + Math.floor(s % 86400 / 3600) + 'h'
+  : s >= 3600 ? Math.floor(s / 3600) + 'h ' + Math.floor(s % 3600 / 60) + 'm' : s >= 60 ? Math.floor(s / 60) + 'm ' + (s % 60) + 's' : s + 's';
+
+let key = localStorage.getItem('bascule-key') || '';
+function keyFromHash() {
+  const k = new URLSearchParams(location.hash.slice(1)).get('key');
+  if (k) { key = k; localStorage.setItem('bascule-key', k); history.replaceState(null, '', location.pathname); }
+}
+keyFromHash();
+addEventListener('hashchange', () => { keyFromHash(); poll(); });
+
+$('keylabel').textContent = L.key; $('save').textContent = L.save;
+$('keyform').addEventListener('submit', (e) => { e.preventDefault(); key = $('keyinput').value.trim(); localStorage.setItem('bascule-key', key); $('keyinput').value = ''; poll(); });
+
+function stateOf(t) {
+  if (!t) return 'idle';
+  if (t.coolingForS) return 'cooling';
+  if (!t.ok && !t.err) return 'idle';
+  return t.ok ? 'ready' : 'failing';
+}
+// Several keys per model: the model is usable while one key is.
+function stateOfModel(st, id) {
+  const ks = Object.entries(st.targets).filter(([hid]) => hid.startsWith(id + '#')).map(([, t]) => t);
+  if (!ks.length) return { s: 'idle', t: null };
+  for (const s of ['ready', 'idle']) { const t = ks.find((k) => stateOf(k) === s); if (t) return { s, t }; }
+  const cooling = ks.filter((t) => t.coolingForS).sort((a, b) => a.coolingForS - b.coolingForS)[0];
+  return cooling ? { s: 'cooling', t: cooling } : { s: 'failing', t: ks[0] };
+}
+const label = (s, t) => L[s] + (s === 'cooling' ? ' ' + dur(t.coolingForS) : '');
+
+function render(st) {
+  $('version').textContent = 'v' + st.version;
+  $('uptime').textContent = L.up + ' ' + dur(st.uptimeS);
+  const cards = [[L.requests, st.requests], [L.fallbacks, st.fallbacks], [L.failures, st.failures], [L.cacheHits, st.cacheHits],
+    [L.hedges, st.hedges], [L.tokensIn, st.tokens.prompt], [L.tokensOut, st.tokens.completion]];
+  $('cards').replaceChildren(...cards.map(([k, v]) => { const c = el('div', 'card', k); c.prepend(el('b', '', fmt(v))); return c; }));
+
+  $('combos').replaceChildren(...Object.entries(st.combos || {}).map(([name, ids]) => {
+    const row = el('div', 'combo', el('strong', '', name));
+    ids.forEach((id, i) => {
+      const { s, t } = stateOfModel(st, id);
+      const chip = el('span', 'chip ' + s, id);
+      chip.title = label(s, t) + (st.cannot[id] ? ' · ' + L.lacks + st.cannot[id].join(', ') : '');
+      if (i) row.append(el('span', 'arrow', '→'));
+      row.append(chip);
+    });
+    return row;
+  }));
+
+  const rows = Object.entries(st.targets).sort(([a], [b]) => a.localeCompare(b));
+  $('none').hidden = rows.length > 0; $('table').hidden = !rows.length;
+  $('thead').replaceChildren(el('tr', '', el('th', '', L.target), el('th', '', L.state), el('th', 'num', 'ok'), el('th', 'num', 'err'),
+    el('th', 'num', L.latency), el('th', 'num', L.limit), el('th', '', '')));
+  $('tbody').replaceChildren(...rows.map(([hid, t]) => {
+    const s = stateOf(t), base = hid.replace(/^[a-z]+:/, '').replace(/#[0-9]+$/, '');
+    return el('tr', '', el('td', '', hid), el('td', 'st ' + s, label(s, t)), el('td', 'num', fmt(t.ok)), el('td', 'num', fmt(t.err)),
+      el('td', 'num', t.ok ? t.latencyMs + ' ms' : '–'), el('td', 'num', t.learnedRpm ? t.learnedRpm + L.perMin : ''),
+      el('td', 'dim', st.cannot[base] ? L.lacks + st.cannot[base].join(', ') : ''));
+  }));
+}
+
+async function poll() {
+  clearTimeout(poll.timer);
+  try {
+    const r = await fetch('/stats', { headers: key ? { authorization: 'Bearer ' + key } : {}, cache: 'no-store' });
+    if (r.status === 401) {
+      $('keyform').hidden = false; $('app').hidden = true; $('version').textContent = $('uptime').textContent = $('live').textContent = '';
+      $('keymsg').textContent = key ? L.badKey : ''; $('keyinput').focus();
+      return;
+    }
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    $('keyform').hidden = true; $('app').hidden = false;
+    render(await r.json());
+    $('live').className = 'live'; $('live').textContent = L.live;
+  } catch {
+    $('live').className = 'live down'; $('live').textContent = L.offline;
+  }
+  poll.timer = setTimeout(poll, document.hidden ? 10000 : 2000);
+}
+document.addEventListener('visibilitychange', () => { if (!document.hidden) poll(); });
+$('h-combos').textContent = L.combos; $('h-targets').textContent = L.targets; $('none').textContent = L.none;
+poll();
+`;
+const DASHBOARD = `<!doctype html>
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>bascule</title><style>${DASHBOARD_CSS}</style></head>
+<body><main>
+<header><h1>bascule</h1><span id="version" class="dim"></span><span id="uptime" class="dim"></span><span id="live" class="live"></span></header>
+<form id="keyform" hidden><label id="keylabel" for="keyinput"></label><input id="keyinput" type="password" autocomplete="off">
+<button id="save" type="submit"></button><p id="keymsg" class="msg"></p></form>
+<div id="app" hidden>
+<div id="cards" class="grid"></div>
+<h2 id="h-combos"></h2><div id="combos"></div>
+<h2 id="h-targets"></h2><p id="none" class="dim"></p>
+<table id="table"><thead id="thead"></thead><tbody id="tbody"></tbody></table>
+</div>
+</main><script>${DASHBOARD_JS}</script></body></html>`;
+const sha = (s) => `'sha256-${createHash('sha256').update(s).digest('base64')}'`;
+const DASHBOARD_CSP = `default-src 'none'; style-src ${sha(DASHBOARD_CSS)}; script-src ${sha(DASHBOARD_JS)}; connect-src 'self'; `
+  + `form-action 'none'; base-uri 'none'; frame-ancestors 'none'`;
 
 const server = http.createServer(async (req, res) => {
   const path = req.url.split('?')[0].replace(/\/+$/, '') || '/';
@@ -1145,6 +1319,12 @@ const server = http.createServer(async (req, res) => {
     return res.end();
   }
   if (path === '/health') return send(res, 200, { ok: true });
+  // The page itself holds nothing secret: it asks for the key, then reads /stats with it.
+  if (req.method === 'GET' && (path === '/' || path === '/dashboard')) {
+    res.writeHead(200, { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store', 'x-content-type-options': 'nosniff',
+      'referrer-policy': 'no-referrer', 'x-frame-options': 'DENY', 'content-security-policy': DASHBOARD_CSP });
+    return res.end(DASHBOARD);
+  }
   // Known before auth, so even a rejected Anthropic-format client gets an error it can parse.
   res.anthropic = /^(\/v1)?\/messages(\/count_tokens)?$/.test(path);
   if (!authed(req)) return send(res, 401, err('invalid api key', 'unauthorized'));
@@ -1200,6 +1380,7 @@ server.on('error', (e) => {
 server.listen(PORT, HOST, () => {
   console.log(`bascule ${VERSION} on http://${HOST}:${PORT}/v1  providers: ${Object.keys(providers).join(', ') || '(none — add keys to .env)'}`);
   console.log(`config: ${CONFIG_PATH}${API_KEY ? '' : '  (no BASCULE_KEY: any local program can use it)'}`);
+  console.log(`dashboard: ${localBase()}/  (or run: bascule dashboard)`);
 });
 function shutdown() {
   saveState();

@@ -20,6 +20,8 @@ bascule                  # http://127.0.0.1:20129/v1
 
 While it runs, `bascule status` shows live counters: requests, fallbacks, tokens, and the state of every target (ready, cooling, learned rate limit).
 
+The same view lives in your browser: `bascule dashboard` opens http://127.0.0.1:20129/, which refreshes every 2 seconds and shows each combo as a chain of targets, green when ready, orange while pausing, red when failing. The page is built into `server.mjs` (no extra files, nothing loaded from the internet) and reads the stats with your `BASCULE_KEY`.
+
 Point any OpenAI client at it:
 
 ```python
@@ -100,7 +102,7 @@ Une seule adresse locale, compatible OpenAI, devant tous tes fournisseurs d'IA. 
 2. `bascule init`, puis mettre tes clés API dans `~/.bascule/.env`.
 3. `bascule doctor` pour vérifier que tes clés marchent.
    Pour Claude Code : `ANTHROPIC_BASE_URL=http://127.0.0.1:20129 claude`.
-4. `bascule`, puis régler tes outils sur `http://127.0.0.1:20129/v1` avec le modèle `auto`. `bascule status` montre ce qui se passe.
+4. `bascule`, puis régler tes outils sur `http://127.0.0.1:20129/v1` avec le modèle `auto`. `bascule status` montre ce qui se passe, et `bascule dashboard` ouvre la même vue dans le navigateur, en direct.
 
 Utilise seulement des comptes et des clés auxquels tu as droit : pas de comptes gratuits multiples, pas d'abonnement grand public utilisé comme clé API.
 
