@@ -24,6 +24,7 @@ if (arg === '--help' || arg === '-h') {
   bascule           start the router (default http://127.0.0.1:20129/v1)
   bascule doctor    check every configured key and model (add --deep to send a tiny real request)
   bascule status    show live stats of the running router
+  bascule discover  find retired models and new free ones (add --apply to update the config)
   bascule dashboard open the live dashboard of the running router in the browser
 
 Config and keys are reloaded automatically when their files change (or on SIGHUP).
@@ -43,7 +44,7 @@ if (arg === 'init') {
   console.log(`config: ${cfgOut}\nkeys:   ${envOut}  (add your provider API keys, then run: bascule)`);
   process.exit(0);
 }
-if (arg && !['doctor', 'status', 'dashboard'].includes(arg)) { console.error(`unknown argument "${arg}" (try --help)`); process.exit(2); }
+if (arg && !['doctor', 'status', 'dashboard', 'discover'].includes(arg)) { console.error(`unknown argument "${arg}" (try --help)`); process.exit(2); }
 
 // ---------- config ----------
 // Variables already set in the real environment win over the file. Those that came from the
@@ -1166,6 +1167,118 @@ const localBase = () => {
   return `http://${host.includes(':') ? `[${host}]` : host}:${PORT}`;
 };
 
+// ---------- discover ----------
+// Free models come and go every few weeks. `bascule discover` lists, per provider: configured models
+// the provider no longer offers, chat models it offers that the config does not use, and, where the
+// listing carries prices (OpenRouter), the models that cost nothing. --apply writes the safe part:
+// retired models out, the best free ones in, with a backup of the previous config.
+const NOT_CHAT = /embed|whisper|tts|orpheus|playai|audio|speech|transcri|guard|moderat|rerank|image|dall-e|sora|realtime|search|computer-use|safety|lyria|music|video|^openrouter\/(auto|free)$/i;
+// Stealth models are free because the prompts are kept to train them: never picked for anyone.
+const isFree = (m) => m.pricing && Number(m.pricing.prompt) === 0 && Number(m.pricing.completion) === 0 && !/^stealth\//.test(m.id);
+// Tool support first (agents need it), then context size, then the newest.
+const rank = (a, b) => b.id.endsWith(':free') - a.id.endsWith(':free') || (b.supported_parameters?.includes('tools') ?? false) - (a.supported_parameters?.includes('tools') ?? false)
+  || (b.context_length || 0) - (a.context_length || 0) || (b.created || 0) - (a.created || 0);
+
+async function listModelsOf(p, key) {
+  const url = p.type === 'anthropic' ? `${p.baseUrl}/v1/models` : `${p.baseUrl}/models`;
+  const r = await fetch(url, { headers: key === undefined ? {} : authHeaders(p, key), signal: AbortSignal.timeout(10_000) });
+  if (!r.ok) throw new Error(`HTTP ${r.status}`);
+  const data = (await r.json()).data;
+  if (!Array.isArray(data)) throw new Error('no model list');
+  return data.map((m) => ({ ...m, id: String(m.id).replace(/^models\//, '') }));
+}
+
+async function discover(apply) {
+  const found = {};
+  for (const [name, raw] of Object.entries(cfg.providers || {})) {
+    const p = providers[name];
+    let list;
+    try {
+      // A provider without a key can still show its public catalogue (OpenRouter does).
+      list = await listModelsOf(p || { ...raw, name, type: raw.type || 'openai', headers: raw.headers || {} }, p?.keys[0]);
+    } catch (e) {
+      console.log(`  -  ${name}: ${p ? `cannot list models (${e.cause?.code || e.message})` : 'no key set, skipped'}`);
+      continue;
+    }
+    const ids = new Set(list.map((m) => m.id));
+    const configured = raw.models || [];
+    const retired = configured.filter((m) => !ids.has(m));
+    // Prices only mean something when the catalogue mixes free and paid models (OpenRouter). Groq or
+    // Gemini list prices too, yet their whole catalogue is on the account's free tier.
+    const free = list.filter(isFree).filter((m) => !NOT_CHAT.test(m.id)).sort(rank);
+    const priced = free.length > 0;
+    const fresh = (priced ? free : list.filter((m) => !NOT_CHAT.test(m.id))).filter((m) => !configured.includes(m.id));
+    found[name] = { retired, free: free.filter((m) => !configured.includes(m.id)).map((m) => m.id), hasKey: Boolean(p) };
+    console.log(`  ${p ? '✓' : '-'}  ${name}: ${list.length} models listed${priced ? `, ${free.length} free` : ''}${p ? '' : ' (no key: public list)'}`);
+    for (const m of retired) console.log(`       retired: ${m}  (no longer offered: remove it)`);
+    for (const m of fresh.slice(0, 8)) {
+      const tags = [isFree(m) && 'free', m.supported_parameters?.includes('tools') && 'tools', m.context_length && `${Math.round(m.context_length / 1000)}k context`].filter(Boolean);
+      console.log(`       new:     ${m.id}${tags.length ? `  (${tags.join(', ')})` : ''}`);
+    }
+    if (fresh.length > 8) console.log(`       ... and ${fresh.length - 8} more`);
+    if (!p && free.length) console.log(`       a free ${name} key unlocks these: put it in ${ENV_PATH || '.env'}`);
+  }
+  const retiredCount = Object.values(found).reduce((a, f) => a + f.retired.length, 0);
+  let toAdd = Object.entries(found).filter(([, f]) => f.hasKey && f.free.length);
+  // Being listed is no proof of access: only models that answer a tiny request are added, 3 per provider.
+  if (apply) {
+    for (const [n, f] of toAdd) {
+      const ok = [];
+      for (const m of f.free) {
+        if (ok.length === 3) break;
+        try {
+          const up = await callOnce({ provider: providers[n], model: m, id: `${n}/${m}` }, { key: providers[n].keys[0] },
+            { messages: [{ role: 'user', content: 'ping' }], max_tokens: 16 }, AbortSignal.timeout(30_000), '/chat/completions');
+          await readJson(up.reader); up.cleanup();
+          ok.push(m);
+          console.log(`  ✓  ${n}/${m} answers`);
+        } catch (e) {
+          // A 429 is about the account (daily free quota), not the model: testing more only burns tries.
+          if (e.status === 429) { console.log(`  -  ${n}: free quota used up for now (429), try again later`); break; }
+          console.log(`  ✗  ${n}/${m} skipped: ${e.status || ''} ${String(e.message).replace(/\s+/g, ' ').slice(0, 80)}`);
+        }
+      }
+      f.free = ok;
+    }
+    toAdd = toAdd.filter(([, f]) => f.free.length);
+  } else for (const [, f] of toAdd) f.free = f.free.slice(0, 3);
+  if (!retiredCount && !toAdd.length) { console.log('\n  nothing to change automatically'); return true; }
+  if (!apply) {
+    console.log(`\n  run "bascule discover --apply" to remove ${retiredCount} retired model${retiredCount === 1 ? '' : 's'}`
+      + `${toAdd.length ? ` and add ${toAdd.map(([n, f]) => `${f.free.length} free ${n} model${f.free.length === 1 ? '' : 's'}`).join(', ')} to the "auto" combo` : ''}`);
+    return true;
+  }
+  // Edit the file as written, with its ${VARIABLES} intact, not the expanded config in memory.
+  const text = readFileSync(CONFIG_PATH, 'utf8');
+  const file = JSON.parse(text);
+  const drop = new Set(Object.entries(found).flatMap(([n, f]) => f.retired.map((m) => `${n}/${m}`)));
+  for (const [n, f] of Object.entries(found)) {
+    file.providers[n].models = file.providers[n].models.filter((m) => !f.retired.includes(m));
+  }
+  for (const [name, c] of Object.entries(file.combos || {})) {
+    const keep = (list) => list.filter((t) => !drop.has(t));
+    if (Array.isArray(c)) file.combos[name] = keep(c); else c.targets = keep(c.targets || []);
+  }
+  const auto = file.combos?.auto;
+  const autoList = Array.isArray(auto) ? auto : auto?.targets;
+  for (const [n, f] of toAdd) {
+    for (const m of f.free) {
+      file.providers[n].models.push(m);
+      // Free cloud models go before the keyless local fallback (Ollama), which stays last.
+      if (autoList && !autoList.includes(`${n}/${m}`)) {
+        const local = autoList.findIndex((t) => file.providers[t.split('/')[0]]?.requiresKey === false);
+        autoList.splice(local < 0 ? autoList.length : local, 0, `${n}/${m}`);
+      }
+    }
+  }
+  writeFileSync(CONFIG_PATH + '.bak', text);
+  writeFileSync(CONFIG_PATH, JSON.stringify(file, null, 2) + '\n');
+  console.log(`\n  updated ${CONFIG_PATH} (previous version in ${CONFIG_PATH}.bak)`);
+  if (CONFIG_PATH === join(ROOT, 'config.json') && !localSetup) console.log('  note: this is the bundled config, replaced on update. Run "bascule init" to get your own in ~/.bascule');
+  console.log('  a running bascule reloads it by itself');
+  return true;
+}
+
 async function printStatus() {
   const url = `${localBase()}/stats`;
   let st;
@@ -1193,6 +1306,7 @@ const ENDPOINTS = { '/v1/chat/completions': '/chat/completions', '/v1/embeddings
 
 if (arg === 'doctor') process.exit((await doctor(process.argv.includes('--deep'))) ? 0 : 1);
 if (arg === 'status') process.exit((await printStatus()) ? 0 : 1);
+if (arg === 'discover') process.exit((await discover(process.argv.includes('--apply'))) ? 0 : 1);
 // The key rides in the URL fragment, which browsers never send to the server; the page moves it
 // to localStorage and wipes it from the address bar.
 if (arg === 'dashboard') {

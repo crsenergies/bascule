@@ -39,6 +39,16 @@ const completion = (content, model = 'm') => ({ id: 'x', object: 'chat.completio
 const sse = (res) => { res.writeHead(200, { 'content-type': 'text/event-stream' }); return (obj) => res.write(`data: ${typeof obj === 'string' ? obj : JSON.stringify(obj)}\n\n`); };
 
 // ---------- mock providers ----------
+// A catalogue that mixes free and paid models, like OpenRouter's. Only "works:free" answers.
+const catalog = await mock('catalog', (req, res, body) => body.model === 'works:free' ? json(res, completion('pong', body.model))
+  : json(res, { error: { message: 'no endpoints found' } }, 404),
+(req, res) => json(res, { data: [
+  { id: 'kept', pricing: { prompt: '0.000001', completion: '0.000002' } },
+  { id: 'works:free', pricing: { prompt: '0', completion: '0' }, supported_parameters: ['tools'], context_length: 128000 },
+  { id: 'broken:free', pricing: { prompt: '0', completion: '0' }, supported_parameters: ['tools'], context_length: 256000 },
+  { id: 'stealth/secret', pricing: { prompt: '0', completion: '0' }, context_length: 999000 },
+  { id: 'embed-small:free', pricing: { prompt: '0', completion: '0' } },
+] }));
 const echo = await mock('echo', (req, res, body) => {
   if (req.url.endsWith('/embeddings')) return json(res, { object: 'list', data: [{ embedding: [0.1, 0.2] }], model: body.model });
   const last = body.messages.at(-1);
@@ -910,6 +920,36 @@ try {
     c = await start();
     try { assert.equal((await cost()).usd, 6, 'spend of the day survives a restart'); }
     finally { c.kill(); }
+  });
+  await test('discover finds retired and free models; --apply keeps only those that answer', async () => {
+    const home = mkdtempSync(join(tmpdir(), 'bascule-disc-'));
+    const cfgPath = join(home, 'config.json');
+    writeFileSync(cfgPath, JSON.stringify({ providers: {
+      cat: { baseUrl: catalog, keys: ['${CAT_KEY}'], models: ['kept', 'gone'] },
+      local: { baseUrl: echo, requiresKey: false, models: ['m'] } },
+    combos: { auto: { hedgeMs: 5, targets: ['cat/kept', 'cat/gone', 'local/m'] }, other: ['cat/gone', 'local/m'] } }, null, 2));
+    const run = (args) => new Promise((ok) => {
+      const c = spawn(process.execPath, [SERVER, 'discover', ...args], { cwd: home, env: { ...env, BASCULE_CONFIG: cfgPath, CAT_KEY: 'k' } });
+      let stdout = '', stderr = '';
+      c.stdout.on('data', (d) => (stdout += d)); c.stderr.on('data', (d) => (stderr += d));
+      c.on('exit', (status) => ok({ status, stdout, stderr }));
+    });
+    let r = await run([]);
+    assert.equal(r.status, 0, r.stderr);
+    assert.match(r.stdout, /cat: 5 models listed, 2 free/);
+    assert.match(r.stdout, /retired: gone/);
+    assert.match(r.stdout, /new: +broken:free +\(free, tools, 256k context\)/);
+    assert.ok(!/stealth|embed/.test(r.stdout), 'stealth and non-chat models are never offered');
+    assert.equal(JSON.parse(readFileSync(cfgPath, 'utf8')).providers.cat.models.length, 2, 'dry run writes nothing');
+    r = await run(['--apply']);
+    assert.equal(r.status, 0, r.stderr);
+    assert.match(r.stdout, /broken:free skipped: 404/);
+    const out = JSON.parse(readFileSync(cfgPath, 'utf8'));
+    assert.deepEqual(out.providers.cat.models, ['kept', 'works:free']);
+    assert.equal(out.providers.cat.keys[0], '${CAT_KEY}', 'variables stay unexpanded');
+    assert.deepEqual(out.combos.auto, { hedgeMs: 5, targets: ['cat/kept', 'cat/works:free', 'local/m'] }, 'free model goes before the local fallback');
+    assert.deepEqual(out.combos.other, ['local/m']);
+    assert.equal(JSON.parse(readFileSync(cfgPath + '.bak', 'utf8')).providers.cat.models.length, 2, 'backup of the previous config');
   });
   await test('SIGTERM stops the server within 5 s', async () => {
     const p2 = port + 1;

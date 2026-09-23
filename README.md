@@ -18,6 +18,8 @@ bascule doctor           # checks every key and model; --deep sends one tiny req
 bascule                  # http://127.0.0.1:20129/v1
 ```
 
+Free models come and go every few weeks. `bascule discover` checks each provider's catalogue: models in your config that are no longer offered, new chat models you could use, and, where the catalogue has prices (OpenRouter), the ones that cost nothing. `bascule discover --apply` removes the retired models and adds up to 3 free ones per provider to the `auto` combo, before the local fallback. Before adding a model it sends it one tiny request, so only models that really answer get in. The previous config is kept as `config.json.bak`. Stealth models (free because they keep your prompts for training) are never picked.
+
 While it runs, `bascule status` shows live counters: requests, fallbacks, tokens, and the state of every target (ready, cooling, learned rate limit).
 
 The same view lives in your browser: `bascule dashboard` opens http://127.0.0.1:20129/, which refreshes every 2 seconds and shows each combo as a chain of targets, green when ready, orange while pausing, red when failing. The page is built into `server.mjs` (no extra files, nothing loaded from the internet) and reads the stats with your `BASCULE_KEY`.
@@ -113,7 +115,7 @@ Une seule adresse locale, compatible OpenAI, devant tous tes fournisseurs d'IA. 
 2. `bascule init`, puis mettre tes clés API dans `~/.bascule/.env`.
 3. `bascule doctor` pour vérifier que tes clés marchent.
    Pour Claude Code : `ANTHROPIC_BASE_URL=http://127.0.0.1:20129 claude`.
-4. `bascule`, puis régler tes outils sur `http://127.0.0.1:20129/v1` avec le modèle `auto`. `bascule status` montre ce qui se passe, et `bascule dashboard` ouvre la même vue dans le navigateur, en direct. Pour suivre vos dépenses, indiquez les prix des modèles payants (`prices`, en dollars par million de tokens) et un plafond (`budget.dailyUsd`) : une fois le plafond du jour atteint, seuls les modèles gratuits sont utilisés jusqu'à minuit.
+4. `bascule`, puis régler tes outils sur `http://127.0.0.1:20129/v1` avec le modèle `auto`. `bascule status` montre ce qui se passe, et `bascule dashboard` ouvre la même vue dans le navigateur, en direct. `bascule discover` repère les modèles retirés et les nouveaux modèles gratuits ; `bascule discover --apply` met la config à jour (après avoir vérifié que chaque modèle ajouté répond vraiment). Pour suivre vos dépenses, indiquez les prix des modèles payants (`prices`, en dollars par million de tokens) et un plafond (`budget.dailyUsd`) : une fois le plafond du jour atteint, seuls les modèles gratuits sont utilisés jusqu'à minuit.
 
 Utilise seulement des comptes et des clés auxquels tu as droit : pas de comptes gratuits multiples, pas d'abonnement grand public utilisé comme clé API.
 
