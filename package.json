@@ -1,0 +1,34 @@
+{
+  "name": "bascule",
+  "version": "1.0.0",
+  "description": "Lean OpenAI-compatible AI router with fallback, key rotation, cooldowns, cache and Anthropic translation. Zero dependencies.",
+  "type": "module",
+  "bin": {
+    "bascule": "server.mjs"
+  },
+  "scripts": {
+    "start": "node server.mjs",
+    "test": "node test.mjs"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "license": "MIT",
+  "keywords": [
+    "llm",
+    "openai",
+    "proxy",
+    "router",
+    "fallback",
+    "ollama",
+    "anthropic",
+    "gateway"
+  ],
+  "files": [
+    "server.mjs",
+    "config.json",
+    ".env.example",
+    "README.md",
+    "LICENSE"
+  ]
+}
