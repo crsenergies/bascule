@@ -404,6 +404,9 @@ async function callOnce(t, k, body, clientSignal, endpoint) {
 // Errors that mean "try next target". A 400 is the caller's fault and would fail everywhere,
 // except when it says the prompt is too long: a model with a bigger context may still take it.
 const TOO_LONG = /context|too (long|large)|maximum.*tokens|token limit|reduce the length/i;
+// Some providers (Gemini) reject a bad key with 400 instead of 401. Read it as a 401.
+const BAD_KEY = /api[ _-]?key|API_KEY_INVALID|unauthenticated|invalid.*(credential|token)/i;
+const normalise = (status, message) => (status === 400 && BAD_KEY.test(message) ? 401 : status);
 const retryable = (e) => e.status === 0 || e.status === 401 || e.status === 403 || e.status === 404
   || e.status === 408 || e.status === 409 || e.status === 413 || e.status === 429 || e.status >= 500
   || (e.status === 400 && TOO_LONG.test(e.message));
@@ -475,7 +478,7 @@ async function route(res, body, { endpoint, requested, cacheable }) {
       return;
     } catch (e) {
       if (clientAbort.signal.aborted) return;
-      const status = e instanceof Upstream ? e.status : 0;
+      const status = e instanceof Upstream ? normalise(e.status, String(e.message)) : 0;
       errors.push(`${t.id}: ${status || 'ERR'} ${String(e.message).slice(0, 160)}`);
       cooldown(k.hid, status, e.retryAfter);
       if (res.headersSent) { // mid-stream: bytes already left, report in-band and stop
@@ -603,7 +606,9 @@ const server = http.createServer(async (req, res) => {
         return await route(res, body, { endpoint, requested,
           cacheable: !body.stream && (body.temperature === 0 || cfg.cache?.always === true) });
       }
-      return await route(res, { ...body, stream: false }, { endpoint, requested, cacheable: true });
+      // Embeddings never stream; drop the field rather than send it (Gemini rejects unknown fields).
+      const { stream: _ignored, ...rest } = body;
+      return await route(res, rest, { endpoint, requested, cacheable: true });
     }
     send(res, 404, err('not found', 'not_found'));
   } catch (e) {

@@ -16,7 +16,7 @@
     "cerebras":   { "type": "openai", "baseUrl": "https://api.cerebras.ai/v1", "keys": ["${CEREBRAS_API_KEY}"],
                     "models": ["gpt-oss-120b", "qwen-3.8-27b"] },
     "gemini":     { "type": "openai", "baseUrl": "https://generativelanguage.googleapis.com/v1beta/openai", "keys": ["${GEMINI_API_KEY}"],
-                    "models": ["gemini-3.8-flash", "gemini-3.5-flash-lite", "gemini-2.5-flash"] },
+                    "models": ["gemini-3.8-flash", "gemini-3.5-flash-lite"] },
     "openrouter": { "type": "openai", "baseUrl": "https://openrouter.ai/api/v1", "keys": ["${OPENROUTER_API_KEY}"],
                     "models": ["openrouter/free", "qwen/qwen3.8-27b:free", "google/gemma-4-31b-it:free"] },
     "mistral":    { "type": "openai", "baseUrl": "https://api.mistral.ai/v1", "keys": ["${MISTRAL_API_KEY}"], "streamUsage": false,

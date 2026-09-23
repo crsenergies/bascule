@@ -47,6 +47,7 @@ const echo = await mock('echo', (req, res, body) => {
 const limited = await mock('limited', (req, res) => { res.writeHead(429, { 'retry-after': '60' }); res.end('rate limited'); });
 const limitedDate = await mock('limitedDate', (req, res) => { res.writeHead(429, { 'retry-after': new Date(Date.now() + 90_000).toUTCString() }); res.end('slow down'); });
 const badKey = await mock('badKey', (req, res) => (req.headers.authorization === 'Bearer good' ? json(res, completion('second key')) : json(res, { error: 'bad key' }, 401)));
+const badKey400 = await mock('badKey400', (req, res) => (req.headers.authorization === 'Bearer good' ? json(res, completion('ok after 400 key')) : json(res, [{ error: { code: 400, message: 'Please pass a valid API key', status: 'INVALID_ARGUMENT' } }], 400)));
 const broken = await mock('broken', (req, res) => json(res, { error: 'boom' }, 500));
 const badReq = await mock('badReq', (req, res) => json(res, { error: { message: 'temperature must be a number' } }, 400));
 const tooLong = await mock('tooLong', (req, res) => json(res, { error: { message: "This model's maximum context length is 8192 tokens" } }, 400));
@@ -108,14 +109,14 @@ writeFileSync(join(dir, 'config.json'), JSON.stringify({
   firstByteTimeoutMs: 300, idleTimeoutMs: 300, timeoutMs: 400,
   providers: {
     echo: P(echo, { models: ['m', 'only-here'] }), limited: P(limited, { keys: ['k1', 'k2'] }), limitedDate: P(limitedDate),
-    badKey: P(badKey, { keys: ['bad', 'good'] }), broken: P(broken, { keys: ['k1', 'k2', 'k3'] }), badReq: P(badReq), tooLong: P(tooLong),
+    badKey: P(badKey, { keys: ['bad', 'good'] }), badKey400: P(badKey400, { keys: ['bad', 'good'] }), broken: P(broken, { keys: ['k1', 'k2', 'k3'] }), badReq: P(badReq), tooLong: P(tooLong),
     tooBig: P(tooBig), streamErr: P(streamErr), streamEmpty: P(streamEmpty), streamCut: P(streamCut), streamStall: P(streamStall),
     silent: P(silent), slowBody: P(slowBody), garbage: P(garbage), hang: P(hang), fast: P(fast), slow: P(slow),
     an: P(anthropic, { type: 'anthropic', keys: ['ak'], models: ['claude'] }), anCrlf: P(anthropicCrlf, { type: 'anthropic' }), anErr: P(anthropicErr, { type: 'anthropic' }),
     off: { baseUrl: 'http://127.0.0.1:1', keys: ['${UNSET_VAR}'], models: ['x'] },
   },
   combos: {
-    auto: ['limited/m', 'echo/m'], dated: ['limitedDate/m', 'echo/m'], keys: ['badKey/m'], dead: ['broken/m', 'echo/m'],
+    auto: ['limited/m', 'echo/m'], dated: ['limitedDate/m', 'echo/m'], keys: ['badKey/m'], keys400: ['badKey400/m'], dead: ['broken/m', 'echo/m'],
     badreq: ['badReq/m', 'echo/m'], toolong: ['tooLong/m', 'echo/m'], toobig: ['tooBig/m', 'echo/m'],
     serr: ['streamErr/m', 'echo/m'], sempty: ['streamEmpty/m', 'echo/m'], scut: ['streamCut/m', 'echo/m'], sstall: ['streamStall/m'],
     silent: ['silent/m', 'echo/m'], slowbody: ['slowBody/m', 'echo/m'], garbage: ['garbage/m', 'echo/m'], hang: ['hang/m'],
@@ -198,6 +199,10 @@ try {
   await test('401 key is skipped, sibling key answers', async () => {
     const r = await post({ model: 'keys', messages: msg() });
     assert.equal((await r.json()).choices[0].message.content, 'second key');
+  });
+  await test('400 "invalid API key" (Gemini style) is treated as a bad key', async () => {
+    const r = await post({ model: 'keys400', messages: msg() });
+    assert.equal((await r.json()).choices[0].message.content, 'ok after 400 key');
   });
   await test('500 condemns the target without trying its other keys', async () => {
     const r = await post({ model: 'dead', messages: msg() });
@@ -362,6 +367,7 @@ try {
     assert.equal(r.status, 200);
     assert.equal(r.headers.get('x-bascule-target'), 'echo/m');
     assert.equal(seen.echo.path, '/embeddings');
+    assert.ok(!('stream' in seen.echo.body), 'no stream field sent to embeddings');
   });
   await test('embedding failure does not bench the model for chat', async () => {
     assert.equal((await post({ model: 'dead', input: 'x' }, {}, '/v1/embeddings')).status, 200); // broken/m fails on embeddings
