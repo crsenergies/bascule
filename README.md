@@ -38,6 +38,7 @@ client.chat.completions.create(model="auto", messages=[{"role": "user", "content
 - Separate timeouts: time to first byte, total time for plain calls, and maximum silence inside a stream.
 - Several keys per provider, rotated on 429. Cooldowns honour `retry-after` and the delay some providers put in the error body (Gemini's `retryDelay`), back off exponentially, and park an invalid key for 30 minutes (including Gemini's 400 "invalid API key").
 - Rate limits: when every target is only rate limited and one frees up within `maxWaitMs` (default 20 s), the request waits instead of failing. Otherwise it returns 429 with `retry-after`, which OpenAI SDKs honour.
+- Size limits: a "request too large" answer (Groq's per-minute token cap, context limits) is learned per target. Larger requests skip that target from then on, smaller ones keep using it, and the target is not put on cooldown.
 - Per-minute budgets: set `rpm` on a provider, or let bascule learn it from a 429 that states the quota (Gemini does). A target at its budget is skipped without calling it, so no quota is burnt on requests that could only fail.
 - Identical concurrent `temperature: 0` requests share a single upstream call.
 - Speed: upstream connections are kept alive and warmed up at start, which saves the 100-200 ms TLS handshake Node's `fetch` pays after 4 s of idle (measured: 170-190 ms less per request on Groq and Gemini). Combos can hedge: with `hedgeMs`, if the first target has not answered in time, the next one starts in parallel and the first answer wins (on by default for `auto`, 3 s, and `fast`, 1 s). bascule itself adds about 0.3 ms per request.
@@ -84,7 +85,7 @@ bascule routes between accounts and keys you are entitled to use. Respect each p
 ## Tests
 
 ```bash
-node test.mjs   # 100 end-to-end tests against mock providers, no network, no keys
+node test.mjs   # 104 end-to-end tests against mock providers, no network, no keys
 ```
 
 They cover fallback for every error class, key rotation, timeouts, streaming failures, the Anthropic translation, the security guards, 300 concurrent requests, memory growth over 3,000 requests, and the command line.

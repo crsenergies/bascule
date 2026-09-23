@@ -676,12 +676,14 @@ function loadState() {
     const st = JSON.parse(readFileSync(STATE_PATH, 'utf8'));
     for (const [id, caps] of Object.entries(st.cannot || {})) lacks.set(id, new Set(caps.filter((c) => c === 'vision' || c === 'tools')));
     for (const [hid, rpm] of Object.entries(st.rpm || {})) if (Number(rpm) > 0) h(hid).learnedRpm = Number(rpm);
+    for (const [hid, max] of Object.entries(st.maxTokens || {})) if (Number(max) > 0) h(hid).maxTokens = Number(max);
   } catch {} // no state yet, or unreadable: start fresh
 }
 function saveState() {
   const cannot = Object.fromEntries([...lacks].filter(([, c]) => c.size).map(([id, c]) => [id, [...c]]));
   const rpm = Object.fromEntries([...health].filter(([, s]) => s.learnedRpm).map(([hid, s]) => [hid, s.learnedRpm]));
-  const json = JSON.stringify({ cannot, rpm });
+  const maxTokens = Object.fromEntries([...health].filter(([, s]) => s.maxTokens).map(([hid, s]) => [hid, s.maxTokens]));
+  const json = JSON.stringify({ cannot, rpm, maxTokens });
   if (json === saveState.last) return;
   try {
     mkdirSync(HOME_DIR, { recursive: true, mode: 0o700 });
@@ -690,6 +692,15 @@ function saveState() {
     saveState.last = json;
   } catch (e) { console.error(`cannot save ${STATE_PATH}: ${e.message}`); }
 }
+// "Request too large ... (TPM): Limit 8000, Requested 30082" (Groq, OpenAI) names the largest request
+// the target takes. It is about this request's size, not the key's health.
+function sizeLimit(status, message) {
+  if (status !== 413 && status !== 429 && status !== 400) return 0;
+  const m = /too large|too long|maximum context/i.test(message) && message.match(/Limit:?\s*(\d+)[\s\S]{0,40}?Requested:?\s*(\d+)/i);
+  return m && Number(m[2]) > Number(m[1]) ? Number(m[1]) : 0;
+}
+// Rough token count, enough to compare with a learned limit: about 4 characters per token.
+const estimateTokens = (body) => Math.ceil(JSON.stringify([body.messages, body.tools]).length / 4) + (body.max_tokens || body.max_completion_tokens || 0);
 const normalise = (status, message) => (status === 400 && BAD_KEY.test(message) ? 401 : status);
 // The model produced something the provider itself rejected (Groq: invalid tool call). Another
 // model may do better; nothing is wrong with the request or the target in general.
@@ -835,6 +846,7 @@ async function attempt(res, body, { endpoint, requested, targets: allTargets, ck
     const pairs = targets.filter((t) => !permanent.has(t.id))
       .flatMap((t) => keysFor(t, endpoint).map((k) => ({ t, k })));
     for (const p of pairs) overBudget(p.t, p.k);
+    const size = estimateTokens(body);
     // A cooling pair that frees up before the deadline is waited for. One that stays cool past
     // it is tried anyway as a last resort, unless its delay is certain (stated by the provider,
     // over its known quota, dead key): that call could only fail and burn quota.
@@ -851,6 +863,8 @@ async function attempt(res, body, { endpoint, requested, targets: allTargets, ck
       errors.push(`${t.id}: ${status || 'ERR'} ${String(e.message).slice(0, 160)}`);
       cooldown(k.hid, status, e.retryAfter);
       if (e.rpm) h(k.hid).learnedRpm = e.rpm;
+      const cap = sizeLimit(status, String(e.message));
+      if (cap) { Object.assign(h(k.hid), { maxTokens: cap, until: 0, fails: 0, hard: false }); permanent.add(t.id); return; }
       const miss = capabilityMiss(status, String(e.message), need);
       if (miss) { lacksFor(t.id).add(miss); permanent.add(t.id); }
       else if (status === 400 && GENERATION_FAILED.test(String(e.message))) { h(k.hid).until = 0; deadTargets.add(t.id); }
@@ -860,6 +874,7 @@ async function attempt(res, body, { endpoint, requested, targets: allTargets, ck
     for (let i = 0; i < ready.length; i++) {
       let { t, k } = ready[i];
       if (deadTargets.has(t.id) || permanent.has(t.id) || tried.has(k.hid)) continue;
+      if (h(k.hid).maxTokens && size > h(k.hid).maxTokens) { errors.push(`${t.id}: skipped, request ~${size} tokens > its limit ${h(k.hid).maxTokens}`); continue; }
       if (clientAbort.signal.aborted) return null;
       if (tries++) stats.fallbacks++;
       h(k.hid).calls.push(Date.now());
@@ -897,6 +912,12 @@ async function attempt(res, body, { endpoint, requested, targets: allTargets, ck
         errors.push(`${t.id}: ${status || 'ERR'} ${String(e.message).slice(0, 160)}`);
         cooldown(k.hid, status, e.retryAfter);
         if (e.rpm) h(k.hid).learnedRpm = e.rpm;
+        const cap = res.headersSent ? 0 : sizeLimit(status, String(e.message));
+        if (cap) { // the key is fine for smaller requests: no cooldown, remember the size, try the next target
+          Object.assign(h(k.hid), { maxTokens: cap, until: 0, fails: 0, hard: false });
+          permanent.add(t.id);
+          continue;
+        }
         if (res.headersSent) { // mid-stream: bytes already left, report in-band and stop
           const msg = `upstream ${t.id} failed mid-stream: ${e.message}`;
           res.end(res.anthropic ? `event: error\ndata: ${JSON.stringify({ type: 'error', error: { type: 'api_error', message: msg } })}\n\n`
@@ -983,7 +1004,8 @@ function status() {
   const now = Date.now();
   const targets = {};
   for (const [id, s] of health) targets[id] = { ok: s.ok, err: s.err, latencyMs: Math.round(s.lat),
-    coolingForS: s.until > now ? Math.ceil((s.until - now) / 1000) : 0, ...(s.learnedRpm && { learnedRpm: s.learnedRpm }) };
+    coolingForS: s.until > now ? Math.ceil((s.until - now) / 1000) : 0, ...(s.learnedRpm && { learnedRpm: s.learnedRpm }),
+    ...(s.maxTokens && { maxTokens: s.maxTokens }) };
   const cannot = Object.fromEntries([...lacks].filter(([, c]) => c.size).map(([id, c]) => [id, [...c]]));
   return { version: VERSION, uptimeS: Math.round(process.uptime()), providers: Object.keys(providers), cannot,
     cacheSize: cache.size, ...stats, targets };

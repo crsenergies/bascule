@@ -100,6 +100,10 @@ const quota = await mock('quota', (req, res) => (++quotaCalls === 1
   : json(res, completion('quota ok'))));
 const daily = await mock('daily', (req, res) => json(res, { error: { message: 'Rate limit exceeded: free-models-per-day', code: 429,
   metadata: { headers: { 'X-RateLimit-Limit': '50', 'X-RateLimit-Remaining': '0', 'X-RateLimit-Reset': String(Date.now() + 3 * 3600_000) } } } }, 429));
+// Groq's real 413 text for a request over the per-minute token limit.
+const small = await mock('small', (req, res, body) => (JSON.stringify(body.messages).length > 4000
+  ? json(res, { error: { message: 'Request too large for model `m` in organization `o` service tier `on_demand` on tokens per minute (TPM): Limit 800, Requested 3082, please reduce your message size and try again.', type: 'tokens', code: 'rate_limit_exceeded' } }, 413)
+  : json(res, completion('small ok'))));
 const budget = await mock('budget', (req, res) => json(res, completion('budget')));
 // Groq-like: string content only, no images. Ollama-like: no tools.
 const textOnly = await mock('textOnly', (req, res, body) => (body.messages.some((m) => typeof m.content !== 'string')
@@ -160,7 +164,7 @@ writeFileSync(join(dir, 'config.json'), JSON.stringify({
     echo: P(echo, { models: ['m', 'only-here'] }), limited: P(limited, { keys: ['k1', 'k2'] }), limitedDate: P(limitedDate),
     badKey: P(badKey, { keys: ['bad', 'good'] }), badKey400: P(badKey400, { keys: ['bad', 'good'] }), broken: P(broken, { keys: ['k1', 'k2', 'k3'] }), badReq: P(badReq), tooLong: P(tooLong),
     tooBig: P(tooBig), streamErr: P(streamErr), streamEmpty: P(streamEmpty), namedErr: P(namedErr), blank: P(blank), lateErr: P(lateErr), toolFail: P(toolFail), streamCut: P(streamCut), streamStall: P(streamStall),
-    silent: P(silent), flaky429: P(flaky429), shared: P(shared), budget: P(budget, { rpm: 2 }), daily: P(daily), quota: P(quota), slowBody: P(slowBody), garbage: P(garbage), hang: P(hang), fast: P(fast), slow: P(slow), tortoise: P(tortoise), fresh: P(fast), tuned: P(fast, { minMaxTokens: 1024, params: { reasoning_effort: 'low' } }), textOnly: P(textOnly), noTools: P(noTools),
+    silent: P(silent), flaky429: P(flaky429), shared: P(shared), budget: P(budget, { rpm: 2 }), small: P(small), daily: P(daily), quota: P(quota), slowBody: P(slowBody), garbage: P(garbage), hang: P(hang), fast: P(fast), slow: P(slow), tortoise: P(tortoise), fresh: P(fast), tuned: P(fast, { minMaxTokens: 1024, params: { reasoning_effort: 'low' } }), textOnly: P(textOnly), noTools: P(noTools),
     an: P(anthropic, { type: 'anthropic', keys: ['ak'], models: ['claude'] }), anCrlf: P(anthropicCrlf, { type: 'anthropic' }), anErr: P(anthropicErr, { type: 'anthropic' }),
     off: { baseUrl: 'http://127.0.0.1:1', keys: ['${UNSET_VAR}'], models: ['x'] },
   },
@@ -171,7 +175,7 @@ writeFileSync(join(dir, 'config.json'), JSON.stringify({
     silent: ['silent/m', 'echo/m'], slowbody: ['slowBody/m', 'echo/m'], garbage: ['garbage/m', 'echo/m'], hang: ['hang/m'],
     claude: ['an/claude'], crlf: ['anCrlf/m'], anerr: ['anErr/m', 'echo/m'], allfail: ['broken/m'], all429: ['limited/m'], emb: ['an/claude', 'echo/m'],
     flaky: ['flaky429/m'], hedge: { targets: ['tortoise/m', 'fast/m'], hedgeMs: 60 }, nohedge: ['tortoise/m', 'fast/m'],
-    hedgeFail: { targets: ['broken/m', 'tortoise/m'], hedgeMs: 60 }, hedgeStream: { targets: ['tortoise/m', 'echo/m'], hedgeMs: 60 }, vision: ['textOnly/m', 'echo/m'], visionNone: ['textOnly/m'], toolsc: ['noTools/m', 'echo/m'], budgeted: ['budget/m', 'echo/m'], daily: ['daily/m', 'echo/m'], learn: ['quota/m', 'echo/m'], rr: { strategy: 'round-robin', targets: ['fast/m', 'slow/m'] }, fastest: { strategy: 'fastest', targets: ['slow/m', 'fast/m'] },
+    hedgeFail: { targets: ['broken/m', 'tortoise/m'], hedgeMs: 60 }, hedgeStream: { targets: ['tortoise/m', 'echo/m'], hedgeMs: 60 }, vision: ['textOnly/m', 'echo/m'], visionNone: ['textOnly/m'], toolsc: ['noTools/m', 'echo/m'], budgeted: ['budget/m', 'echo/m'], sized: ['small/m', 'echo/m'], daily: ['daily/m', 'echo/m'], learn: ['quota/m', 'echo/m'], rr: { strategy: 'round-robin', targets: ['fast/m', 'slow/m'] }, fastest: { strategy: 'fastest', targets: ['slow/m', 'fast/m'] },
     explore: { strategy: 'fastest', targets: ['slow/m', 'fast/m', 'fresh/m'] },
   },
 }));
@@ -310,6 +314,18 @@ try {
     await (await post({ model: 'daily', messages: msg() })).json();
     assert.equal(hits.daily, 1, 'no second call before the stated reset');
     assert.ok((await stats()).targets['daily/m#0'].coolingForS > 3 * 3600 - 60);
+  });
+  await test('"request too large" is learned: big requests skip the target, small ones still use it', async () => {
+    const big = msg('x'.repeat(12000));
+    let r = await post({ model: 'sized', messages: big });
+    assert.equal(r.headers.get('x-bascule-target'), 'echo/m');
+    assert.equal(hits.small, 1);
+    r = await post({ model: 'sized', messages: big });
+    assert.equal(r.headers.get('x-bascule-target'), 'echo/m');
+    assert.equal(hits.small, 1, 'second big request must not hit the small target');
+    r = await post({ model: 'sized', messages: msg('tiny') });
+    assert.equal(r.headers.get('x-bascule-target'), 'small/m', 'no cooldown: small requests still go there');
+    assert.equal((await stats()).targets['small/m#0'].maxTokens, 800);
   });
   await test('per-minute quota stated in a 429 is learned and respected', async () => {
     await (await post({ model: 'learn', messages: msg() })).json(); // 429 teaches rpm = 1, falls back to echo
