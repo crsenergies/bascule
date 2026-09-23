@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // Bascule — lean OpenAI-compatible AI router. Zero dependencies, Node >= 20.
 import http from 'node:http';
-import { readFileSync, existsSync, mkdirSync, copyFileSync, writeFileSync, watchFile } from 'node:fs';
+import { readFileSync, existsSync, mkdirSync, copyFileSync, writeFileSync, watchFile, renameSync } from 'node:fs';
 import { createHash, timingSafeEqual, randomBytes } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
@@ -390,6 +390,11 @@ function buildRequest(t, key, body, endpoint) {
       headers: { 'x-api-key': key, 'anthropic-version': '2023-06-01', ...p.headers } };
   }
   const payload = { ...body, model: t.model };
+  // Some OpenAI-compatible APIs (Groq) only accept string content. A text-only parts array
+  // means exactly the same thing as its joined text, so send that.
+  if (Array.isArray(body.messages) && body.messages.some((m) => Array.isArray(m?.content)))
+    payload.messages = body.messages.map((m) => (Array.isArray(m?.content) && m.content.every((c) => c?.type === 'text')
+      ? { ...m, content: m.content.map((c) => c.text ?? '').join('\n') } : m));
   if (payload.stream && p.streamUsage) payload.stream_options = { include_usage: true, ...payload.stream_options };
   return { url: `${p.baseUrl}${endpoint}`, payload,
     headers: { ...(key ? { authorization: `Bearer ${key}` } : {}), ...p.headers } };
@@ -466,6 +471,43 @@ async function callOnce(t, k, body, clientSignal, endpoint) {
 const TOO_LONG = /context|too (long|large)|maximum.*tokens|token limit|reduce the length/i;
 // Some providers (Gemini) reject a bad key with 400 instead of 401. Read it as a 401.
 const BAD_KEY = /api[ _-]?key|API_KEY_INVALID|unauthenticated|invalid.*(credential|token)/i;
+// A 400 saying the model cannot take images or tools is not the caller's fault: another model can.
+const NO_VISION = /image|vision|multimodal|content must be a string/i;
+const NO_TOOLS = /\btools?\b.*(not supported|unsupported|does not support)|(not support|unsupported).*\b(tools?|function)|tool_choice/i;
+const needs = (body) => ({
+  vision: Array.isArray(body.messages) && body.messages.some((m) => Array.isArray(m?.content) && m.content.some((c) => c?.type === 'image_url' || c?.type === 'input_image')),
+  tools: Array.isArray(body.tools) && body.tools.length > 0,
+});
+// Capabilities learned from such errors, per target ("provider/model"), for the process lifetime.
+const lacks = new Map();
+const lacksFor = (id) => lacks.get(id) ?? (lacks.set(id, new Set()), lacks.get(id));
+function capabilityMiss(status, message, need) {
+  if (status !== 400 && status !== 422 && status !== 404) return null;
+  if (need.vision && NO_VISION.test(message)) return 'vision';
+  if (need.tools && NO_TOOLS.test(message)) return 'tools';
+  return null;
+}
+// What bascule learned (capability gaps, per-minute quotas) survives restarts in state.json.
+const STATE_PATH = join(HOME_DIR, 'state.json');
+function loadState() {
+  try {
+    const st = JSON.parse(readFileSync(STATE_PATH, 'utf8'));
+    for (const [id, caps] of Object.entries(st.cannot || {})) lacks.set(id, new Set(caps.filter((c) => c === 'vision' || c === 'tools')));
+    for (const [hid, rpm] of Object.entries(st.rpm || {})) if (Number(rpm) > 0) h(hid).learnedRpm = Number(rpm);
+  } catch {} // no state yet, or unreadable: start fresh
+}
+function saveState() {
+  const cannot = Object.fromEntries([...lacks].filter(([, c]) => c.size).map(([id, c]) => [id, [...c]]));
+  const rpm = Object.fromEntries([...health].filter(([, s]) => s.learnedRpm).map(([hid, s]) => [hid, s.learnedRpm]));
+  const json = JSON.stringify({ cannot, rpm });
+  if (json === saveState.last) return;
+  try {
+    mkdirSync(HOME_DIR, { recursive: true, mode: 0o700 });
+    writeFileSync(STATE_PATH + '.tmp', json, { mode: 0o600 });
+    renameSync(STATE_PATH + '.tmp', STATE_PATH); // atomic: a crash mid-write never leaves a torn file
+    saveState.last = json;
+  } catch (e) { console.error(`cannot save ${STATE_PATH}: ${e.message}`); }
+}
 const normalise = (status, message) => (status === 400 && BAD_KEY.test(message) ? 401 : status);
 const retryable = (e) => e.status === 0 || e.status === 401 || e.status === 403 || e.status === 404
   || e.status === 408 || e.status === 409 || e.status === 413 || e.status === 429 || e.status >= 500
@@ -545,13 +587,18 @@ async function route(res, body, { endpoint, requested, cacheable }) {
   } catch (e) { share?.(null); throw e; }
 }
 
-async function attempt(res, body, { endpoint, requested, targets, ck, t0 }) {
+async function attempt(res, body, { endpoint, requested, targets: allTargets, ck, t0 }) {
+  let targets = allTargets;
   const clientAbort = new AbortController();
   res.on('close', () => { if (!res.writableFinished) clientAbort.abort(); });
   const deadline = t0 + MAX_WAIT;
   const permanent = new Set(); // targets that waiting cannot fix (bad request, unknown model...)
   const errors = [];
-  let tries = 0, lastStatus = 503;
+  let tries = 0, lastStatus = 503, capError = null;
+  // Skip targets known to lack what this request needs, unless that would leave none at all.
+  const need = needs(body);
+  const able = targets.filter((t) => ![...lacksFor(t.id)].some((c) => need[c]));
+  if (able.length) targets = able;
 
   for (;;) {
     const now = Date.now();
@@ -598,6 +645,14 @@ async function attempt(res, body, { endpoint, requested, targets, ck, t0 }) {
           log(502, requested, t.id, t0, tries - 1);
           return null;
         }
+        const miss = capabilityMiss(status, String(e.message), need);
+        if (miss) {
+          lacksFor(t.id).add(miss);
+          h(k.hid).until = 0; h(k.hid).fails = 0; // the target is fine, just not for this request
+          permanent.add(t.id);
+          capError = { status, message: `no target could handle ${miss === 'vision' ? 'images' : 'tools'}:\n${errors.join('\n')}` };
+          continue;
+        }
         if (!retryable({ status, message: String(e.message) })) {
           log(status, requested, t.id, t0, tries - 1);
           send(res, status, err(e.message, 'upstream_error'));
@@ -622,6 +677,11 @@ async function attempt(res, body, { endpoint, requested, targets, ck, t0 }) {
   const retryIn = Math.ceil((free - Date.now()) / 1000);
   const headers = retryIn > 0 && Number.isFinite(retryIn) ? { 'retry-after': String(retryIn) } : {};
   if (!tries) lastStatus = 429; // nothing was even tried: every target is at a known limit
+  if (capError && errors.every((x) => / 40[04] | 422 /.test(x))) { // only capability misses: the request itself is the issue
+    log(capError.status, requested, 'none', t0, Math.max(tries - 1, 0));
+    send(res, 400, err(capError.message, 'unsupported_input'));
+    return null;
+  }
   log(lastStatus, requested, 'none', t0, Math.max(tries - 1, 0));
   send(res, lastStatus, err(`all targets failed:\n${errors.join('\n') || `every target is rate limited; first one frees up in ${retryIn}s`}`, 'all_targets_failed'), headers);
   return null;
@@ -660,7 +720,8 @@ function status() {
   const targets = {};
   for (const [id, s] of health) targets[id] = { ok: s.ok, err: s.err, latencyMs: Math.round(s.lat),
     coolingForS: s.until > now ? Math.ceil((s.until - now) / 1000) : 0, ...(s.learnedRpm && { learnedRpm: s.learnedRpm }) };
-  return { version: VERSION, uptimeS: Math.round(process.uptime()), providers: Object.keys(providers),
+  const cannot = Object.fromEntries([...lacks].filter(([, c]) => c.size).map(([id, c]) => [id, [...c]]));
+  return { version: VERSION, uptimeS: Math.round(process.uptime()), providers: Object.keys(providers), cannot,
     cacheSize: cache.size, ...stats, targets };
 }
 
@@ -837,12 +898,15 @@ server.listen(PORT, HOST, () => {
   console.log(`config: ${CONFIG_PATH}${API_KEY ? '' : '  (no BASCULE_KEY: any local program can use it)'}`);
 });
 function shutdown() {
+  saveState();
   server.close(() => process.exit(0));
   server.closeIdleConnections();
   setTimeout(() => { server.closeAllConnections(); process.exit(0); }, 5000).unref();
 }
 for (const sig of ['SIGINT', 'SIGTERM']) process.on(sig, shutdown);
 process.on('SIGHUP', () => reload('SIGHUP'));
+loadState();
+setInterval(saveState, 30_000).unref();
 // Editors save in bursts (truncate, write, rename): wait for the file to settle before reloading.
 let reloadTimer;
 for (const f of [CONFIG_PATH, ENV_PATH].filter(Boolean)) {

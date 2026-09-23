@@ -40,6 +40,8 @@ client.chat.completions.create(model="auto", messages=[{"role": "user", "content
 - Rate limits: when every target is only rate limited and one frees up within `maxWaitMs` (default 20 s), the request waits instead of failing. Otherwise it returns 429 with `retry-after`, which OpenAI SDKs honour.
 - Per-minute budgets: set `rpm` on a provider, or let bascule learn it from a 429 that states the quota (Gemini does). A target at its budget is skipped without calling it, so no quota is burnt on requests that could only fail.
 - Identical concurrent `temperature: 0` requests share a single upstream call.
+- Capability learning: when a model rejects images or tools, the request moves to the next model, and bascule remembers the gap so later image or tool requests skip that model while text requests still use it. What it learns (capability gaps, per-minute quotas) is kept in `~/.bascule/state.json` across restarts.
+- Text-only content arrays are sent as plain strings, for APIs such as Groq that accept nothing else.
 - Combo strategies: `priority` (default), `fastest` (measured latency), `round-robin`.
 - OpenAI ⇄ Anthropic translation: system prompt, images, tools, tool results, streaming.
 - Response cache for `temperature: 0` requests (LRU, 10 min by default), whitespace compaction of prompts.
@@ -78,7 +80,7 @@ bascule routes between accounts and keys you are entitled to use. Respect each p
 ## Tests
 
 ```bash
-node test.mjs   # 74 end-to-end tests against mock providers, no network, no keys
+node test.mjs   # 80 end-to-end tests against mock providers, no network, no keys
 ```
 
 They cover fallback for every error class, key rotation, timeouts, streaming failures, the Anthropic translation, the security guards, 300 concurrent requests, memory growth over 3,000 requests, and the command line.

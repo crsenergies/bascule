@@ -73,6 +73,13 @@ const quota = await mock('quota', (req, res) => (++quotaCalls === 1
       { '@type': 'type.googleapis.com/google.rpc.RetryInfo', retryDelay: '0.1s' }] } }], 429)
   : json(res, completion('quota ok'))));
 const budget = await mock('budget', (req, res) => json(res, completion('budget')));
+// Groq-like: string content only, no images. Ollama-like: no tools.
+const textOnly = await mock('textOnly', (req, res, body) => (body.messages.some((m) => typeof m.content !== 'string')
+  ? json(res, { error: { message: 'messages[0].content must be a string', type: 'invalid_request_error' } }, 400)
+  : json(res, completion(`text:${body.messages.at(-1).content}`))));
+const noTools = await mock('noTools', (req, res, body) => (body.tools
+  ? json(res, { error: { message: 'registry.ollama.ai/library/m does not support tools' } }, 400)
+  : json(res, completion('no tools here'))));
 const fast = await mock('fast', (req, res) => json(res, completion('fast')));
 const slow = await mock('slow', async (req, res) => { await sleep(150); json(res, completion('slow')); });
 
@@ -123,7 +130,7 @@ writeFileSync(join(dir, 'config.json'), JSON.stringify({
     echo: P(echo, { models: ['m', 'only-here'] }), limited: P(limited, { keys: ['k1', 'k2'] }), limitedDate: P(limitedDate),
     badKey: P(badKey, { keys: ['bad', 'good'] }), badKey400: P(badKey400, { keys: ['bad', 'good'] }), broken: P(broken, { keys: ['k1', 'k2', 'k3'] }), badReq: P(badReq), tooLong: P(tooLong),
     tooBig: P(tooBig), streamErr: P(streamErr), streamEmpty: P(streamEmpty), streamCut: P(streamCut), streamStall: P(streamStall),
-    silent: P(silent), flaky429: P(flaky429), shared: P(shared), budget: P(budget, { rpm: 2 }), quota: P(quota), slowBody: P(slowBody), garbage: P(garbage), hang: P(hang), fast: P(fast), slow: P(slow), fresh: P(fast),
+    silent: P(silent), flaky429: P(flaky429), shared: P(shared), budget: P(budget, { rpm: 2 }), quota: P(quota), slowBody: P(slowBody), garbage: P(garbage), hang: P(hang), fast: P(fast), slow: P(slow), fresh: P(fast), textOnly: P(textOnly), noTools: P(noTools),
     an: P(anthropic, { type: 'anthropic', keys: ['ak'], models: ['claude'] }), anCrlf: P(anthropicCrlf, { type: 'anthropic' }), anErr: P(anthropicErr, { type: 'anthropic' }),
     off: { baseUrl: 'http://127.0.0.1:1', keys: ['${UNSET_VAR}'], models: ['x'] },
   },
@@ -133,7 +140,7 @@ writeFileSync(join(dir, 'config.json'), JSON.stringify({
     serr: ['streamErr/m', 'echo/m'], sempty: ['streamEmpty/m', 'echo/m'], scut: ['streamCut/m', 'echo/m'], sstall: ['streamStall/m'],
     silent: ['silent/m', 'echo/m'], slowbody: ['slowBody/m', 'echo/m'], garbage: ['garbage/m', 'echo/m'], hang: ['hang/m'],
     claude: ['an/claude'], crlf: ['anCrlf/m'], anerr: ['anErr/m', 'echo/m'], allfail: ['broken/m'], all429: ['limited/m'], emb: ['an/claude', 'echo/m'],
-    flaky: ['flaky429/m'], budgeted: ['budget/m', 'echo/m'], learn: ['quota/m', 'echo/m'], rr: { strategy: 'round-robin', targets: ['fast/m', 'slow/m'] }, fastest: { strategy: 'fastest', targets: ['slow/m', 'fast/m'] },
+    flaky: ['flaky429/m'], vision: ['textOnly/m', 'echo/m'], visionNone: ['textOnly/m'], toolsc: ['noTools/m', 'echo/m'], budgeted: ['budget/m', 'echo/m'], learn: ['quota/m', 'echo/m'], rr: { strategy: 'round-robin', targets: ['fast/m', 'slow/m'] }, fastest: { strategy: 'fastest', targets: ['slow/m', 'fast/m'] },
     explore: { strategy: 'fastest', targets: ['slow/m', 'fast/m', 'fresh/m'] },
   },
 }));
@@ -277,6 +284,38 @@ try {
     assert.ok(rs.every((r) => r.status === 200));
     assert.equal(hits.shared, 1);
     assert.ok(rs.some((r) => r.headers.get('x-bascule-cache') === 'shared'));
+  });
+  const img = { type: 'image_url', image_url: { url: 'data:image/png;base64,AAAA' } };
+  await test('text-only content arrays are sent as a plain string', async () => {
+    const r = await post({ model: 'textOnly/m', messages: [{ role: 'user', content: [{ type: 'text', text: 'a' }, { type: 'text', text: 'b' }] }] });
+    assert.equal(r.status, 200);
+    assert.equal((await r.json()).choices[0].message.content, 'text:a\nb');
+  });
+  await test('model that rejects images falls back, and is skipped next time', async () => {
+    const before = hits.textOnly;
+    let r = await post({ model: 'vision', messages: [{ role: 'user', content: [{ type: 'text', text: 'colour?' }, img] }] });
+    assert.equal(r.status, 200);
+    assert.equal(r.headers.get('x-bascule-target'), 'echo/m');
+    assert.equal(hits.textOnly, before + 1);
+    r = await post({ model: 'vision', messages: [{ role: 'user', content: [{ type: 'text', text: 'again' }, img] }] });
+    assert.equal(r.headers.get('x-bascule-target'), 'echo/m');
+    assert.equal(hits.textOnly, before + 1, 'learned: no second image call to a text-only model');
+    assert.deepEqual((await stats()).cannot['textOnly/m'], ['vision']);
+  });
+  await test('text requests still go to a model that lacks vision', async () => {
+    const r = await post({ model: 'vision', messages: msg('plain') });
+    assert.equal(r.headers.get('x-bascule-target'), 'textOnly/m');
+  });
+  await test('images with no capable target give a clear 400', async () => {
+    const r = await post({ model: 'visionNone', messages: [{ role: 'user', content: [img] }] });
+    assert.equal(r.status, 400);
+    assert.match((await r.json()).error.message, /no target could handle images|content must be a string/);
+  });
+  await test('model that rejects tools falls back to one that takes them', async () => {
+    const tools = [{ type: 'function', function: { name: 'f', parameters: { type: 'object', properties: {} } } }];
+    const r = await post({ model: 'toolsc', messages: msg(), tools });
+    assert.equal(r.headers.get('x-bascule-target'), 'echo/m');
+    assert.equal((await post({ model: 'toolsc', messages: msg() })).headers.get('x-bascule-target'), 'noTools/m');
   });
   await test('bare model name resolves to its provider', async () => {
     const r = await post({ model: 'only-here', messages: msg() });
@@ -547,6 +586,30 @@ try {
       await sleep(1800);
       assert.equal(await call('two'), 200, 'broken edit must not take the router down');
     } finally { s4.kill(); }
+  });
+  await test('learned capabilities survive a restart', async () => {
+    const home = mkdtempSync(join(tmpdir(), 'bascule-state-'));
+    const p5 = port + 4;
+    const cfgPath = join(home, 'config.json');
+    writeFileSync(cfgPath, JSON.stringify({ port: p5, providers: { t: { baseUrl: textOnly, keys: ['k'], models: ['m'] }, e: { baseUrl: echo, keys: ['k'], models: ['m'] } },
+      combos: { v: ['t/m', 'e/m'] } }));
+    const start = async () => {
+      const c = spawn(process.execPath, [SERVER], { cwd: home, env: { ...env, BASCULE_CONFIG: cfgPath, BASCULE_HOME: home }, stdio: ['ignore', 'pipe', 'inherit'] });
+      await new Promise((ok) => c.stdout.once('data', ok));
+      return c;
+    };
+    const ask = () => fetch(`http://127.0.0.1:${p5}/v1/chat/completions`, { method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'v', messages: [{ role: 'user', content: [img] }] }) });
+    let c = await start();
+    await (await ask()).text();
+    c.kill('SIGTERM'); await new Promise((ok) => c.on('exit', ok));
+    assert.deepEqual(JSON.parse(readFileSync(join(home, 'state.json'), 'utf8')).cannot, { 't/m': ['vision'] });
+    const before = hits.textOnly;
+    c = await start();
+    try {
+      await (await ask()).text();
+      assert.equal(hits.textOnly, before, 'restarted router must remember t/m has no vision');
+    } finally { c.kill(); }
   });
   await test('SIGTERM stops the server within 5 s', async () => {
     const p2 = port + 1;
