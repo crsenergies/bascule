@@ -80,6 +80,7 @@ const CACHE_MAX = cfg.cache?.maxEntries ?? 500;
 const CACHE_TTL = cfg.cache?.ttlMs ?? 10 * 60_000;
 const COMPACT = cfg.compactWhitespace ?? true;
 const LOG = process.env.BASCULE_LOG !== '0' && cfg.log !== false;
+const MAX_WAIT = cfg.maxWaitMs ?? 20_000;           // how long a request may wait for a rate limit to clear
 
 // Exposing the router beyond this machine without a strong key would let anyone spend the owner's quotas.
 const LOOPBACK = ['127.0.0.1', '::1', 'localhost'].includes(HOST);
@@ -97,7 +98,7 @@ for (const [name, p] of Object.entries(cfg.providers || {})) {
   if (!p.baseUrl) { console.error(`provider "${name}" has no baseUrl, ignored`); continue; }
   providers[name] = { name, type: p.type || 'openai', baseUrl: p.baseUrl.replace(/\/+$/, ''),
     keys: keys.length ? keys : [''], headers: p.headers || {}, models: p.models || [],
-    streamUsage: p.streamUsage !== false, rr: 0 };
+    streamUsage: p.streamUsage !== false, rpm: Number(p.rpm) || 0, rr: 0 };
 }
 
 // Health per "provider/model#keyIndex": cooldown + EWMA latency + failure streak.
@@ -107,13 +108,16 @@ const h = (id) => health.get(id) ?? (health.set(id, { until: 0, fails: 0, lat: 0
 function cooldown(id, status, retryAfter) {
   const s = h(id);
   s.fails++; s.err++;
-  let ms = retryAfter ? retryAfter * 1000 : Math.min(1000 * 2 ** Math.min(s.fails, 8), 5 * 60_000);
+  // Floor of 250 ms: a provider announcing "retry in 1ms" must not turn the wait loop into a busy loop.
+  let ms = retryAfter ? Math.max(retryAfter * 1000, 250) : Math.min(1000 * 2 ** Math.min(s.fails, 8), 5 * 60_000);
   if (status === 401 || status === 403) ms = 30 * 60_000; // bad key: park it
   s.until = Date.now() + ms;
+  // A delay stated by the provider (or a dead key) is certain; a guessed backoff is not.
+  s.hard = Boolean(retryAfter) || status === 401 || status === 403;
 }
 function success(id, ms) {
   const s = h(id);
-  s.fails = 0; s.until = 0; s.ok++;
+  s.fails = 0; s.until = 0; s.hard = false; s.ok++;
   s.lat = s.lat ? s.lat * 0.8 + ms * 0.2 : ms;
 }
 // Best measured latency across a target's keys; unmeasured targets sort last.
@@ -352,7 +356,7 @@ function buildRequest(t, key, body, endpoint) {
 }
 
 class Upstream extends Error {
-  constructor(status, msg, retryAfter) { super(msg); this.status = status; this.retryAfter = retryAfter; }
+  constructor(status, msg, retryAfter, rpm) { super(msg); this.status = status; this.retryAfter = retryAfter; this.rpm = rpm; }
 }
 
 // retry-after is either seconds or an HTTP date.
@@ -362,6 +366,21 @@ function retryAfterS(v) {
   if (Number.isFinite(n)) return Math.max(0, n);
   const d = Date.parse(v);
   return Number.isFinite(d) ? Math.max(0, (d - Date.now()) / 1000) : 0;
+}
+
+// Gemini puts the delay in the body ("retryDelay": "11s"); OpenAI-style APIs in the message ("try again in 1.2s").
+function retryFromBody(txt) {
+  const m = txt.match(/"retryDelay"\s*:\s*"([\d.]+)s"/) || txt.match(/(?:retry|try again) in ([\d.]+)\s*(ms|s)\b/i);
+  if (!m) return 0;
+  const n = parseFloat(m[1]);
+  return m[2] === 'ms' ? n / 1000 : n;
+}
+
+// Gemini's 429 names the per-minute quota it hit ("quotaId": "...PerMinute...", "quotaValue": "15").
+function rpmFromBody(txt) {
+  // quotaDimensions {...} sits between the two fields, so allow nested braces but stay within one violation.
+  const m = txt.match(/"quotaId"\s*:\s*"[^"]*PerMinute[^"]*"[\s\S]{0,400}?"quotaValue"\s*:\s*"(\d+)"/);
+  return m ? Number(m[1]) : 0;
 }
 
 async function callOnce(t, k, body, clientSignal, endpoint) {
@@ -386,7 +405,8 @@ async function callOnce(t, k, body, clientSignal, endpoint) {
   if (!res.ok) {
     const txt = await res.text().catch(() => '');
     cleanup();
-    throw new Upstream(res.status, txt.slice(0, 500) || res.statusText, retryAfterS(res.headers.get('retry-after')));
+    throw new Upstream(res.status, txt.slice(0, 500) || res.statusText,
+      retryAfterS(res.headers.get('retry-after')) || retryFromBody(txt), res.status === 429 ? rpmFromBody(txt) : 0);
   }
   // Streams get an idle timer re-armed on every chunk; plain calls get one overall deadline.
   if (body.stream) arm(IDLE_TIMEOUT, 'stream idle timeout'); else arm(TIMEOUT, 'timeout');
@@ -433,8 +453,29 @@ const stats = { requests: 0, cacheHits: 0, fallbacks: 0, failures: 0, tokens: { 
 const addUsage = (u) => { if (u) { stats.tokens.prompt += u.prompt_tokens || 0; stats.tokens.completion += u.completion_tokens || 0; } };
 
 // ---------- routing ----------
-// Tries each (target, key) pair until one answers. Healthy pairs go first in combo order,
-// cooling ones stay as a last resort rather than failing outright.
+// Identical cacheable requests in flight share one upstream call.
+const inflight = new Map();
+const sleep = (ms, signal) => new Promise((ok) => {
+  const t = setTimeout(ok, ms);
+  signal.addEventListener('abort', () => { clearTimeout(t); ok(); }, { once: true });
+});
+
+// Requests-per-minute budget, counted per model and key: set with `rpm` in the provider config,
+// or learned from a 429 that states the quota. A target at its budget is treated as cooling,
+// so bascule waits or moves on instead of provoking another 429.
+function overBudget(t, k) {
+  const s = h(k.hid), now = Date.now();
+  s.calls = (s.calls || []).filter((x) => x > now - 60_000);
+  const lim = t.provider.rpm || s.learnedRpm;
+  if (!lim || s.calls.length < lim) return false;
+  s.until = Math.max(s.until, s.calls[0] + 60_000);
+  s.hard = true;
+  return true;
+}
+
+// Tries each (target, key) pair until one answers, healthy pairs first in combo order.
+// When every target is only rate limited or overloaded and one frees up within maxWaitMs,
+// the request waits for it instead of failing.
 async function route(res, body, { endpoint, requested, cacheable }) {
   stats.requests++;
   const t0 = Date.now();
@@ -446,57 +487,104 @@ async function route(res, body, { endpoint, requested, cacheable }) {
   if (ck) {
     const hit = cacheGet(ck);
     if (hit) { stats.cacheHits++; log(200, requested, 'cache', t0, 0); return send(res, 200, hit, { 'x-bascule-cache': 'hit' }); }
+    const shared = inflight.get(ck);
+    if (shared) {
+      const out = await shared;
+      if (out) { stats.cacheHits++; log(200, requested, 'shared', t0, 0); return send(res, 200, out, { 'x-bascule-cache': 'shared' }); }
+    }
   }
+  let share = null;
+  if (ck && !inflight.has(ck)) {
+    let resolveShare;
+    inflight.set(ck, new Promise((r) => { resolveShare = r; }));
+    share = (out) => { inflight.delete(ck); resolveShare(out); };
+  }
+  try {
+    const out = await attempt(res, body, { endpoint, requested, targets, ck, t0 });
+    share?.(out);
+  } catch (e) { share?.(null); throw e; }
+}
 
+async function attempt(res, body, { endpoint, requested, targets, ck, t0 }) {
   const clientAbort = new AbortController();
   res.on('close', () => { if (!res.writableFinished) clientAbort.abort(); });
-
-  const now = Date.now();
-  const pairs = targets.flatMap((t) => keysFor(t, endpoint).map((k) => ({ t, k, cool: h(k.hid).until > now })));
-  pairs.sort((a, b) => a.cool - b.cool);
-  const deadTargets = new Set();
+  const deadline = t0 + MAX_WAIT;
+  const permanent = new Set(); // targets that waiting cannot fix (bad request, unknown model...)
   const errors = [];
-  let attempt = 0, lastStatus = 503;
-  for (const { t, k } of pairs) {
-    if (deadTargets.has(t.id)) continue;
-    if (clientAbort.signal.aborted) return;
-    if (attempt++) stats.fallbacks++;
-    const head = { 'x-bascule-target': t.id };
-    let up;
-    try {
-      up = await callOnce(t, k, body, clientAbort.signal, endpoint);
-      if (body.stream) await pipeStream(up, t, res, head);
-      else {
-        const raw = await readJson(up.reader);
-        const out = t.provider.type === 'anthropic' ? fromAnthropic(raw, t.model) : raw;
-        addUsage(out.usage);
-        if (ck) cacheSet(ck, out);
-        send(res, 200, out, head);
-      }
-      success(k.hid, Date.now() - up.t0);
-      log(200, requested, t.id, t0, attempt - 1);
-      return;
-    } catch (e) {
-      if (clientAbort.signal.aborted) return;
-      const status = e instanceof Upstream ? normalise(e.status, String(e.message)) : 0;
-      errors.push(`${t.id}: ${status || 'ERR'} ${String(e.message).slice(0, 160)}`);
-      cooldown(k.hid, status, e.retryAfter);
-      if (res.headersSent) { // mid-stream: bytes already left, report in-band and stop
-        res.end(`data: ${JSON.stringify(err(`upstream ${t.id} failed mid-stream: ${e.message}`, 'upstream_error'))}\n\n`);
-        log(502, requested, t.id, t0, attempt - 1);
-        return;
-      }
-      if (!retryable({ status, message: String(e.message) })) {
-        log(status, requested, t.id, t0, attempt - 1);
-        return send(res, status, err(e.message, 'upstream_error'));
-      }
-      lastStatus = status === 429 ? 429 : 503;
-      if (!keyLevel({ status })) deadTargets.add(t.id);
-    } finally { up?.cleanup(); }
+  let tries = 0, lastStatus = 503;
+
+  for (;;) {
+    const now = Date.now();
+    const pairs = targets.filter((t) => !permanent.has(t.id))
+      .flatMap((t) => keysFor(t, endpoint).map((k) => ({ t, k })));
+    for (const p of pairs) overBudget(p.t, p.k);
+    // A cooling pair that frees up before the deadline is waited for. One that stays cool past
+    // it is tried anyway as a last resort, unless its delay is certain (stated by the provider,
+    // over its known quota, dead key): that call could only fail and burn quota.
+    const coolUntil = (p) => h(p.k.hid).until;
+    const ready = pairs.filter((p) => coolUntil(p) <= now || (coolUntil(p) > deadline && !h(p.k.hid).hard));
+    ready.sort((a, b) => (coolUntil(a) > now) - (coolUntil(b) > now));
+    const deadTargets = new Set();
+
+    for (const { t, k } of ready) {
+      if (deadTargets.has(t.id) || permanent.has(t.id)) continue;
+      if (clientAbort.signal.aborted) return null;
+      if (tries++) stats.fallbacks++;
+      h(k.hid).calls.push(Date.now());
+      const head = { 'x-bascule-target': t.id };
+      let up;
+      try {
+        up = await callOnce(t, k, body, clientAbort.signal, endpoint);
+        let out = null;
+        if (body.stream) await pipeStream(up, t, res, head);
+        else {
+          const raw = await readJson(up.reader);
+          out = t.provider.type === 'anthropic' ? fromAnthropic(raw, t.model) : raw;
+          addUsage(out.usage);
+          if (ck) cacheSet(ck, out);
+          send(res, 200, out, head);
+        }
+        success(k.hid, Date.now() - up.t0);
+        log(200, requested, t.id, t0, tries - 1);
+        return out;
+      } catch (e) {
+        if (clientAbort.signal.aborted) return null;
+        const status = e instanceof Upstream ? normalise(e.status, String(e.message)) : 0;
+        errors.push(`${t.id}: ${status || 'ERR'} ${String(e.message).slice(0, 160)}`);
+        cooldown(k.hid, status, e.retryAfter);
+        if (e.rpm) h(k.hid).learnedRpm = e.rpm;
+        if (res.headersSent) { // mid-stream: bytes already left, report in-band and stop
+          res.end(`data: ${JSON.stringify(err(`upstream ${t.id} failed mid-stream: ${e.message}`, 'upstream_error'))}\n\n`);
+          log(502, requested, t.id, t0, tries - 1);
+          return null;
+        }
+        if (!retryable({ status, message: String(e.message) })) {
+          log(status, requested, t.id, t0, tries - 1);
+          send(res, status, err(e.message, 'upstream_error'));
+          return null;
+        }
+        lastStatus = status === 429 ? 429 : 503;
+        if (status === 404 || status === 400 || status === 413) permanent.add(t.id);
+        else if (!keyLevel({ status })) deadTargets.add(t.id);
+      } finally { up?.cleanup(); }
+    }
+
+    // Nothing answered. Wait for the soonest pair that frees up before the deadline, if any.
+    const soonest = Math.min(...pairs.filter((p) => !permanent.has(p.t.id)).map(coolUntil).filter((u) => u <= deadline));
+    const wait = soonest - Date.now();
+    if (!Number.isFinite(soonest) || clientAbort.signal.aborted) break;
+    if (wait > 0) await sleep(wait, clientAbort.signal);
+    if (clientAbort.signal.aborted) return null;
   }
   stats.failures++;
-  log(lastStatus, requested, 'none', t0, attempt - 1);
-  send(res, lastStatus, err(`all targets failed:\n${errors.join('\n')}`, 'all_targets_failed'));
+  // Tell the client when the first target frees up; OpenAI SDKs honour retry-after on a 429.
+  const free = Math.min(...targets.flatMap((t) => keysFor(t, endpoint).map((k) => h(k.hid).until)));
+  const retryIn = Math.ceil((free - Date.now()) / 1000);
+  const headers = retryIn > 0 && Number.isFinite(retryIn) ? { 'retry-after': String(retryIn) } : {};
+  if (!tries) lastStatus = 429; // nothing was even tried: every target is at a known limit
+  log(lastStatus, requested, 'none', t0, Math.max(tries - 1, 0));
+  send(res, lastStatus, err(`all targets failed:\n${errors.join('\n') || `every target is rate limited; first one frees up in ${retryIn}s`}`, 'all_targets_failed'), headers);
+  return null;
 }
 
 async function readJson(reader) {
@@ -531,7 +619,7 @@ function status() {
   const now = Date.now();
   const targets = {};
   for (const [id, s] of health) targets[id] = { ok: s.ok, err: s.err, latencyMs: Math.round(s.lat),
-    coolingForS: s.until > now ? Math.ceil((s.until - now) / 1000) : 0 };
+    coolingForS: s.until > now ? Math.ceil((s.until - now) / 1000) : 0, ...(s.learnedRpm && { learnedRpm: s.learnedRpm }) };
   return { version: VERSION, uptimeS: Math.round(process.uptime()), providers: Object.keys(providers),
     cacheSize: cache.size, ...stats, targets };
 }

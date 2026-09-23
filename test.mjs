@@ -61,6 +61,17 @@ const slowBody = await mock('slowBody', (req, res) => { res.writeHead(200, { 'co
 const garbage = await mock('garbage', (req, res) => { res.writeHead(200, { 'content-type': 'application/json' }); res.end('<html>oops</html>'); });
 let upstreamClosed = false;
 const hang = await mock('hang', (req, res) => { const w = sse(res); w({ choices: [{ index: 0, delta: { content: 'x' } }] }); res.on('close', () => { upstreamClosed = true; }); });
+let flakyCalls = 0;
+const flaky429 = await mock('flaky429', (req, res) => (++flakyCalls === 1
+  ? json(res, [{ error: { code: 429, status: 'RESOURCE_EXHAUSTED', details: [{ '@type': 'type.googleapis.com/google.rpc.RetryInfo', retryDelay: '0.3s' }] } }], 429)
+  : json(res, completion('after wait'))));
+const shared = await mock('shared', async (req, res) => { await sleep(200); json(res, completion('shared')); });
+let quotaCalls = 0;
+const quota = await mock('quota', (req, res) => (++quotaCalls === 1
+  ? json(res, [{ error: { code: 429, details: [{ '@type': 'type.googleapis.com/google.rpc.QuotaFailure', violations: [{ quotaMetric: 'generativelanguage.googleapis.com/generate_content_free_tier_requests', quotaId: 'GenerateRequestsPerMinutePerProjectPerModel-FreeTier', quotaDimensions: { location: 'global', model: 'm' }, quotaValue: '1' }] },
+      { '@type': 'type.googleapis.com/google.rpc.RetryInfo', retryDelay: '0.1s' }] } }], 429)
+  : json(res, completion('quota ok'))));
+const budget = await mock('budget', (req, res) => json(res, completion('budget')));
 const fast = await mock('fast', (req, res) => json(res, completion('fast')));
 const slow = await mock('slow', async (req, res) => { await sleep(150); json(res, completion('slow')); });
 
@@ -106,12 +117,12 @@ const port = 20000 + Math.floor(Math.random() * 9000);
 const P = (baseUrl, extra = {}) => ({ baseUrl, keys: ['k'], models: ['m'], ...extra });
 writeFileSync(join(dir, 'config.json'), JSON.stringify({
   port, apiKey: 'secret', corsOrigins: ['http://localhost:5173'],
-  firstByteTimeoutMs: 300, idleTimeoutMs: 300, timeoutMs: 400,
+  firstByteTimeoutMs: 300, idleTimeoutMs: 300, timeoutMs: 400, maxWaitMs: 1000,
   providers: {
     echo: P(echo, { models: ['m', 'only-here'] }), limited: P(limited, { keys: ['k1', 'k2'] }), limitedDate: P(limitedDate),
     badKey: P(badKey, { keys: ['bad', 'good'] }), badKey400: P(badKey400, { keys: ['bad', 'good'] }), broken: P(broken, { keys: ['k1', 'k2', 'k3'] }), badReq: P(badReq), tooLong: P(tooLong),
     tooBig: P(tooBig), streamErr: P(streamErr), streamEmpty: P(streamEmpty), streamCut: P(streamCut), streamStall: P(streamStall),
-    silent: P(silent), slowBody: P(slowBody), garbage: P(garbage), hang: P(hang), fast: P(fast), slow: P(slow),
+    silent: P(silent), flaky429: P(flaky429), shared: P(shared), budget: P(budget, { rpm: 2 }), quota: P(quota), slowBody: P(slowBody), garbage: P(garbage), hang: P(hang), fast: P(fast), slow: P(slow),
     an: P(anthropic, { type: 'anthropic', keys: ['ak'], models: ['claude'] }), anCrlf: P(anthropicCrlf, { type: 'anthropic' }), anErr: P(anthropicErr, { type: 'anthropic' }),
     off: { baseUrl: 'http://127.0.0.1:1', keys: ['${UNSET_VAR}'], models: ['x'] },
   },
@@ -121,7 +132,7 @@ writeFileSync(join(dir, 'config.json'), JSON.stringify({
     serr: ['streamErr/m', 'echo/m'], sempty: ['streamEmpty/m', 'echo/m'], scut: ['streamCut/m', 'echo/m'], sstall: ['streamStall/m'],
     silent: ['silent/m', 'echo/m'], slowbody: ['slowBody/m', 'echo/m'], garbage: ['garbage/m', 'echo/m'], hang: ['hang/m'],
     claude: ['an/claude'], crlf: ['anCrlf/m'], anerr: ['anErr/m', 'echo/m'], allfail: ['broken/m'], all429: ['limited/m'], emb: ['an/claude', 'echo/m'],
-    rr: { strategy: 'round-robin', targets: ['fast/m', 'slow/m'] }, fastest: { strategy: 'fastest', targets: ['slow/m', 'fast/m'] },
+    flaky: ['flaky429/m'], budgeted: ['budget/m', 'echo/m'], learn: ['quota/m', 'echo/m'], rr: { strategy: 'round-robin', targets: ['fast/m', 'slow/m'] }, fastest: { strategy: 'fastest', targets: ['slow/m', 'fast/m'] },
   },
 }));
 
@@ -226,7 +237,45 @@ try {
   await test('stalled non-streaming body times out and falls back', async () => assert.equal((await post({ model: 'slowbody', messages: msg() })).status, 200));
   await test('invalid JSON from upstream falls back', async () => assert.equal((await post({ model: 'garbage', messages: msg() })).status, 200));
   await test('all targets failing gives 503', async () => assert.equal((await post({ model: 'allfail', messages: msg() })).status, 503));
-  await test('only rate limits gives 429', async () => assert.equal((await post({ model: 'all429', messages: msg() })).status, 429));
+  await test('only rate limits gives 429 with retry-after', async () => {
+    const r = await post({ model: 'all429', messages: msg() });
+    assert.equal(r.status, 429);
+    assert.ok(Number(r.headers.get('retry-after')) > 0);
+  });
+  await test('a provider-stated delay is not retried as a last resort', async () => {
+    const before = hits.limited;
+    assert.equal((await post({ model: 'all429', messages: msg() })).status, 429);
+    assert.equal(hits.limited, before, 'no call to a target that said wait 60 s');
+  });
+  await test('Gemini-style retryDelay in the body is waited for, then retried', async () => {
+    const t0 = Date.now();
+    const r = await post({ model: 'flaky', messages: msg() });
+    assert.equal(r.status, 200);
+    assert.equal((await r.json()).choices[0].message.content, 'after wait');
+    assert.ok(Date.now() - t0 >= 250, `waited ${Date.now() - t0} ms`);
+    assert.equal(hits.flaky429, 2);
+  });
+  await test('rpm budget moves the third call of the minute to the next target', async () => {
+    const got = [];
+    for (let i = 0; i < 3; i++) got.push((await post({ model: 'budgeted', messages: msg(`b${i}`) })).headers.get('x-bascule-target'));
+    assert.deepEqual(got, ['budget/m', 'budget/m', 'echo/m']);
+    assert.equal(hits.budget, 2);
+  });
+  await test('per-minute quota stated in a 429 is learned and respected', async () => {
+    await (await post({ model: 'learn', messages: msg() })).json(); // 429 teaches rpm = 1, falls back to echo
+    const st = await stats();
+    assert.equal(st.targets['quota/m#0'].learnedRpm, 1);
+    await sleep(150); // past retryDelay: only the learned budget can hold quota/m back now
+    const r = await post({ model: 'learn', messages: msg() });
+    assert.equal(r.headers.get('x-bascule-target'), 'echo/m');
+    assert.equal(hits.quota, 1, 'budget reached: no second call inside the minute');
+  });
+  await test('identical concurrent cacheable requests share one upstream call', async () => {
+    const rs = await Promise.all(Array.from({ length: 5 }, () => post({ model: 'shared/m', temperature: 0, messages: msg('same') })));
+    assert.ok(rs.every((r) => r.status === 200));
+    assert.equal(hits.shared, 1);
+    assert.ok(rs.some((r) => r.headers.get('x-bascule-cache') === 'shared'));
+  });
   await test('bare model name resolves to its provider', async () => {
     const r = await post({ model: 'only-here', messages: msg() });
     assert.equal(r.headers.get('x-bascule-target'), 'echo/only-here');

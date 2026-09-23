@@ -33,7 +33,10 @@ client.chat.completions.create(model="auto", messages=[{"role": "user", "content
 - Fallback on 429, 5xx, 413, timeouts, network errors, invalid upstream JSON, and "prompt too long" errors (a model with a bigger context may take it). A plain 400 is returned as is, since every provider would reject it.
 - Streaming fallback works as long as no byte has reached the client, including when a provider answers 200 and then puts the error in the stream. A failure after that ends the stream with an `error` event instead of cutting it silently.
 - Separate timeouts: time to first byte, total time for plain calls, and maximum silence inside a stream.
-- Several keys per provider, rotated on 429. Cooldowns honour `retry-after`, back off exponentially, and park an invalid key for 30 minutes.
+- Several keys per provider, rotated on 429. Cooldowns honour `retry-after` and the delay some providers put in the error body (Gemini's `retryDelay`), back off exponentially, and park an invalid key for 30 minutes (including Gemini's 400 "invalid API key").
+- Rate limits: when every target is only rate limited and one frees up within `maxWaitMs` (default 20 s), the request waits instead of failing. Otherwise it returns 429 with `retry-after`, which OpenAI SDKs honour.
+- Per-minute budgets: set `rpm` on a provider, or let bascule learn it from a 429 that states the quota (Gemini does). A target at its budget is skipped without calling it, so no quota is burnt on requests that could only fail.
+- Identical concurrent `temperature: 0` requests share a single upstream call.
 - Combo strategies: `priority` (default), `fastest` (measured latency), `round-robin`.
 - OpenAI ⇄ Anthropic translation: system prompt, images, tools, tool results, streaming.
 - Response cache for `temperature: 0` requests (LRU, 10 min by default), whitespace compaction of prompts.
@@ -50,7 +53,7 @@ Lookup order, first found wins:
 | 3 | `~/.bascule/config.json` | `~/.bascule/.env` |
 | 4 | bundled `config.json` | bundled `.env` |
 
-`config.json` lists `providers` (`type`: `openai` or `anthropic`, `baseUrl`, `keys`, `models`, optional `headers` and `streamUsage: false` for APIs that reject `stream_options`) and `combos`. `${VAR}` is replaced by the environment variable. Any OpenAI-compatible service works: add it with its base URL.
+`config.json` lists `providers` (`type`: `openai` or `anthropic`, `baseUrl`, `keys`, `models`, optional `headers`, `rpm`, and `streamUsage: false` for APIs that reject `stream_options`) and `combos`. Top-level tuning: `timeoutMs`, `firstByteTimeoutMs`, `idleTimeoutMs`, `maxWaitMs`, `cache`, `corsOrigins`, `log`. `${VAR}` is replaced by the environment variable. Any OpenAI-compatible service works: add it with its base URL.
 
 Environment variables: `BASCULE_KEY`, `BASCULE_PORT`, `BASCULE_HOST`, `BASCULE_CONFIG`, `BASCULE_HOME`, `BASCULE_LOG=0` (silences the one-line-per-request log).
 
@@ -70,7 +73,7 @@ bascule routes between accounts and keys you are entitled to use. Respect each p
 ## Tests
 
 ```bash
-node test.mjs   # 65 end-to-end tests against mock providers, no network, no keys
+node test.mjs   # 70 end-to-end tests against mock providers, no network, no keys
 ```
 
 They cover fallback for every error class, key rotation, timeouts, streaming failures, the Anthropic translation, the security guards, 300 concurrent requests, memory growth over 3,000 requests, and the command line.
