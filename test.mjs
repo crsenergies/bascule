@@ -123,7 +123,7 @@ writeFileSync(join(dir, 'config.json'), JSON.stringify({
     echo: P(echo, { models: ['m', 'only-here'] }), limited: P(limited, { keys: ['k1', 'k2'] }), limitedDate: P(limitedDate),
     badKey: P(badKey, { keys: ['bad', 'good'] }), badKey400: P(badKey400, { keys: ['bad', 'good'] }), broken: P(broken, { keys: ['k1', 'k2', 'k3'] }), badReq: P(badReq), tooLong: P(tooLong),
     tooBig: P(tooBig), streamErr: P(streamErr), streamEmpty: P(streamEmpty), streamCut: P(streamCut), streamStall: P(streamStall),
-    silent: P(silent), flaky429: P(flaky429), shared: P(shared), budget: P(budget, { rpm: 2 }), quota: P(quota), slowBody: P(slowBody), garbage: P(garbage), hang: P(hang), fast: P(fast), slow: P(slow),
+    silent: P(silent), flaky429: P(flaky429), shared: P(shared), budget: P(budget, { rpm: 2 }), quota: P(quota), slowBody: P(slowBody), garbage: P(garbage), hang: P(hang), fast: P(fast), slow: P(slow), fresh: P(fast),
     an: P(anthropic, { type: 'anthropic', keys: ['ak'], models: ['claude'] }), anCrlf: P(anthropicCrlf, { type: 'anthropic' }), anErr: P(anthropicErr, { type: 'anthropic' }),
     off: { baseUrl: 'http://127.0.0.1:1', keys: ['${UNSET_VAR}'], models: ['x'] },
   },
@@ -134,6 +134,7 @@ writeFileSync(join(dir, 'config.json'), JSON.stringify({
     silent: ['silent/m', 'echo/m'], slowbody: ['slowBody/m', 'echo/m'], garbage: ['garbage/m', 'echo/m'], hang: ['hang/m'],
     claude: ['an/claude'], crlf: ['anCrlf/m'], anerr: ['anErr/m', 'echo/m'], allfail: ['broken/m'], all429: ['limited/m'], emb: ['an/claude', 'echo/m'],
     flaky: ['flaky429/m'], budgeted: ['budget/m', 'echo/m'], learn: ['quota/m', 'echo/m'], rr: { strategy: 'round-robin', targets: ['fast/m', 'slow/m'] }, fastest: { strategy: 'fastest', targets: ['slow/m', 'fast/m'] },
+    explore: { strategy: 'fastest', targets: ['slow/m', 'fast/m', 'fresh/m'] },
   },
 }));
 
@@ -286,6 +287,11 @@ try {
     const a = (await post({ model: 'rr', messages: msg() })).headers.get('x-bascule-target');
     const b = (await post({ model: 'rr', messages: msg() })).headers.get('x-bascule-target');
     assert.notEqual(a, b);
+  });
+  await test('fastest tries an unmeasured target before settling', async () => {
+    // rr above measured fast/m and slow/m; fresh/m has never been called.
+    const r = await post({ model: 'explore', messages: msg() });
+    assert.equal(r.headers.get('x-bascule-target'), 'fresh/m');
   });
   await test('fastest prefers the measured faster target', async () => {
     const r = await post({ model: 'fastest', messages: msg() });
@@ -503,7 +509,7 @@ try {
     const home = mkdtempSync(join(tmpdir(), 'bascule-doc-'));
     writeFileSync(join(home, 'config.json'), JSON.stringify({ providers: {
       good: { baseUrl: echo, keys: ['k'], models: ['m', 'retired'] },
-      bad: { baseUrl: badKey400, keys: ['bad'], models: ['m'] },
+      bad: { baseUrl: badKey400, keys: ['sk-or-v1-misplaced'], models: ['m'] },
       down: { baseUrl: 'http://127.0.0.1:1', keys: ['k'], models: ['m'] },
       nokey: { baseUrl: echo, keys: ['${NOPE_UNSET}'], models: ['m'] } },
       combos: { ok: ['good/m'], dead: ['nokey/m'] } }));
@@ -518,7 +524,7 @@ try {
     assert.match(r.stdout, /✓ +good key 1 \(…k\)/);
     assert.match(r.stdout, /m: listed, answers/);
     assert.match(r.stdout, /retired: NOT LISTED/);
-    assert.match(r.stdout, /✗ +bad key 1 .*invalid key/);
+    assert.match(r.stdout, /✗ +bad key 1 .*invalid key.*looks like a openrouter key: move it to the OPENROUTER_API_KEY line/);
     assert.match(r.stdout, /✗ +down key 1 .*unreachable/);
     assert.match(r.stdout, /nokey: no key set/);
     assert.match(r.stdout, /combo dead: 0\/1 .*unusable/);

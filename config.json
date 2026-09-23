@@ -13,7 +13,7 @@
 
   "providers": {
     "groq":       { "type": "openai", "baseUrl": "https://api.groq.com/openai/v1", "keys": ["${GROQ_API_KEY}", "${GROQ_API_KEY_2}"],
-                    "models": ["openai/gpt-oss-120b", "openai/gpt-oss-20b", "llama-3.3-70b-versatile", "llama-3.1-8b-instant"] },
+                    "models": ["openai/gpt-oss-120b", "openai/gpt-oss-20b", "qwen/qwen3.8-27b"] },
     "cerebras":   { "type": "openai", "baseUrl": "https://api.cerebras.ai/v1", "keys": ["${CEREBRAS_API_KEY}"],
                     "models": ["gpt-oss-120b", "qwen-3.8-27b"] },
     "gemini":     { "type": "openai", "baseUrl": "https://generativelanguage.googleapis.com/v1beta/openai", "keys": ["${GEMINI_API_KEY}"],

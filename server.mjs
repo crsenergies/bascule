@@ -159,8 +159,9 @@ function success(id, ms) {
   s.fails = 0; s.until = 0; s.hard = false; s.ok++;
   s.lat = s.lat ? s.lat * 0.8 + ms * 0.2 : ms;
 }
-// Best measured latency across a target's keys; unmeasured targets sort last.
-const latency = (t) => Math.min(...t.provider.keys.map((_, k) => h(`${t.id}#${k}`).lat || 1e9));
+// Best measured latency across a target's keys. Unmeasured targets sort first: otherwise a
+// target that has never been tried would never get measured, and "fastest" could not find it.
+const latency = (t) => Math.min(...t.provider.keys.map((_, k) => h(`${t.id}#${k}`).lat || 0));
 
 // Resolve requested model into ordered list of { provider, model, id }.
 function resolve(model) {
@@ -694,6 +695,10 @@ function readBody(req, limit = 32 * 1024 * 1024) {
 
 // ---------- doctor & status ----------
 const mask = (k) => (k ? `…${k.slice(-4)}` : 'no key');
+// Public key prefixes: enough to spot a key pasted on the wrong line of .env.
+const KEY_PREFIXES = [['sk-or-', 'openrouter'], ['sk-ant-', 'anthropic'], ['gsk_', 'groq'], ['AIza', 'gemini'],
+  ['csk-', 'cerebras'], ['sk-proj-', 'openai'], ['sk-svcacct-', 'openai']];
+const keyOwner = (k) => KEY_PREFIXES.find(([pre]) => k.startsWith(pre))?.[1];
 async function doctor(deep) {
   let working = 0;
   for (const name of Object.keys(cfg.providers || {})) {
@@ -713,7 +718,9 @@ async function doctor(deep) {
       }
       if (!r.ok) {
         const why = r.status === 401 || r.status === 403 || (r.status === 400 && BAD_KEY.test(await r.text().catch(() => ''))) ? 'invalid key' : `HTTP ${r.status}`;
-        console.log(`  ✗  ${name} key ${i + 1} (${mask(key)}): ${why}`);
+        const owner = keyOwner(key);
+        const hint = owner && owner !== name && !p.baseUrl.includes(owner) ? `  <- this looks like a ${owner} key: move it to the ${owner.toUpperCase()}_API_KEY line` : '';
+        console.log(`  ✗  ${name} key ${i + 1} (${mask(key)}): ${why}${hint}`);
         continue;
       }
       working++;
