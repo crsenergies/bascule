@@ -680,13 +680,14 @@ function loadState() {
     for (const [id, caps] of Object.entries(st.cannot || {})) lacks.set(id, new Set(caps.filter((c) => c === 'vision' || c === 'tools')));
     for (const [hid, rpm] of Object.entries(st.rpm || {})) if (Number(rpm) > 0) h(hid).learnedRpm = Number(rpm);
     for (const [hid, max] of Object.entries(st.maxTokens || {})) if (Number(max) > 0) h(hid).maxTokens = Number(max);
+    if (st.spend?.day === today() && Number.isFinite(st.spend.usd)) spend = { day: st.spend.day, usd: st.spend.usd, byTarget: st.spend.byTarget || {} };
   } catch {} // no state yet, or unreadable: start fresh
 }
 function saveState() {
   const cannot = Object.fromEntries([...lacks].filter(([, c]) => c.size).map(([id, c]) => [id, [...c]]));
   const rpm = Object.fromEntries([...health].filter(([, s]) => s.learnedRpm).map(([hid, s]) => [hid, s.learnedRpm]));
   const maxTokens = Object.fromEntries([...health].filter(([, s]) => s.maxTokens).map(([hid, s]) => [hid, s.maxTokens]));
-  const json = JSON.stringify({ cannot, rpm, maxTokens });
+  const json = JSON.stringify({ cannot, rpm, maxTokens, spend });
   if (json === saveState.last) return;
   try {
     mkdirSync(HOME_DIR, { recursive: true, mode: 0o700 });
@@ -743,7 +744,34 @@ function tally(kind, ms) {
   b[kind]++;
   if (ms !== undefined) { b.ms += ms; b.n++; }
 }
-const addUsage = (u) => { if (u) { stats.tokens.prompt += u.prompt_tokens || 0; stats.tokens.completion += u.completion_tokens || 0; } };
+const addUsage = (u, t) => {
+  if (!u) return;
+  stats.tokens.prompt += u.prompt_tokens || 0; stats.tokens.completion += u.completion_tokens || 0;
+  if (t) charge(t, u);
+};
+
+// ---------- costs ----------
+// Prices come from config "prices": { "provider/model" or "provider/*": [input, output] }, in US
+// dollars per million tokens. Unpriced targets count as free. Today's spend survives restarts.
+const today = () => new Date().toLocaleDateString('sv'); // YYYY-MM-DD, local time
+let spend = { day: today(), usd: 0, byTarget: {} };
+function priceOf(t) {
+  const p = cfg.prices?.[t.id] ?? cfg.prices?.[`${t.provider.name}/*`];
+  const [i, o] = Array.isArray(p) ? p : p && typeof p === 'object' ? [p.input, p.output] : [];
+  return Number(i) > 0 || Number(o) > 0 ? { input: Number(i) || 0, output: Number(o) || 0 } : null;
+}
+function rollover() { if (spend.day !== today()) spend = { day: today(), usd: 0, byTarget: {} }; }
+function charge(t, u) {
+  const p = priceOf(t);
+  if (!p) return;
+  rollover();
+  const usd = ((u.prompt_tokens || 0) * p.input + (u.completion_tokens || 0) * p.output) / 1e6;
+  spend.usd += usd;
+  spend.byTarget[t.id] = (spend.byTarget[t.id] || 0) + usd;
+}
+const dailyBudget = () => Number(cfg.budget?.dailyUsd) || 0;
+// Once today's spend reaches the budget, only free targets are used until midnight.
+function capped() { rollover(); return dailyBudget() > 0 && spend.usd >= dailyBudget(); }
 
 // ---------- routing ----------
 // Identical cacheable requests in flight share one upstream call.
@@ -852,6 +880,15 @@ async function attempt(res, body, { endpoint, requested, targets: allTargets, ck
   const errors = [];
   let tries = 0, lastStatus = 503, capError = null;
   // Skip targets known to lack what this request needs, unless that would leave none at all.
+  if (capped()) {
+    targets = targets.filter((t) => !priceOf(t));
+    if (!targets.length) {
+      stats.failures++; tally('failed');
+      log(402, requested, 'none', t0, 0);
+      send(res, 402, err(`daily budget of $${dailyBudget()} reached: only free targets are used until midnight, and this model has none`, 'budget_exceeded'));
+      return null;
+    }
+  }
   const need = needs(body);
   const able = targets.filter((t) => ![...lacksFor(t.id)].some((c) => need[c]));
   if (able.length) targets = able;
@@ -914,7 +951,7 @@ async function attempt(res, body, { endpoint, requested, targets: allTargets, ck
           out = t.provider.type === 'anthropic' ? fromAnthropic(raw, t.model) : raw;
           const m = out?.choices?.[0]?.message;
           if (endpoint === '/chat/completions' && !m?.content && !m?.tool_calls?.length) throw new Upstream(502, 'empty answer');
-          addUsage(out.usage);
+          addUsage(out.usage, t);
           if (ck) cacheSet(ck, out);
           send(res, 200, shape(res, out, requested), head);
         }
@@ -997,7 +1034,7 @@ async function readJson(reader) {
 const shape = (res, out, model) => (res.anthropic ? toAnthropicMessage(out, model) : out);
 
 async function pipeStream(up, t, res, head, model) {
-  let gen = t.provider.type === 'anthropic' ? anthropicStream(up.reader, t.model, addUsage) : passthrough(up.reader, addUsage);
+  let gen = t.provider.type === 'anthropic' ? anthropicStream(up.reader, t.model, (u) => addUsage(u, t)) : passthrough(up.reader, (u) => addUsage(u, t));
   if (res.anthropic) gen = toAnthropicStream(gen, model);
   // Pull the first chunk before committing headers: allows fallback if upstream dies instantly.
   const first = await gen.next();
@@ -1029,6 +1066,8 @@ function status() {
     [name, (Array.isArray(c) ? c : c.targets || []).map((t) => parseTarget(t)?.id).filter(Boolean)]));
   return { version: VERSION, uptimeS: Math.round(process.uptime()), providers: Object.keys(providers), cannot,
     cacheSize: cache.size, ...stats, combos, served, targets, now: now,
+    cost: { day: spend.day, usd: spend.usd, byTarget: spend.byTarget, budgetUsd: dailyBudget() || null, capped: capped(),
+      priced: [...new Set(Object.values(cfg.combos || {}).flatMap((c) => Array.isArray(c) ? c : c.targets || []).map(parseTarget).filter((t) => t && priceOf(t)).map((t) => t.id))] },
     timeline: timeline.filter((b) => b.m > now / 60_000 - 60).map((b) => ({ t: b.m * 60_000, ok: b.ok, rerouted: b.rerouted, failed: b.failed,
       latencyMs: b.n ? Math.round(b.ms / b.n) : null })) };
 }
@@ -1137,6 +1176,7 @@ async function printStatus() {
   } catch (e) { console.error(`no router answering on ${url} (${e.cause?.code || e.message}). Start it with: bascule`); return false; }
   console.log(`bascule ${st.version}, up ${st.uptimeS}s, providers: ${st.providers.join(', ')}`);
   console.log(`requests ${st.requests}  cache hits ${st.cacheHits}  fallbacks ${st.fallbacks}  failures ${st.failures}  tokens ${st.tokens.prompt} in / ${st.tokens.completion} out`);
+  console.log(`spent today $${st.cost.usd.toFixed(4)}${st.cost.budgetUsd ? ` of $${st.cost.budgetUsd}${st.cost.capped ? '  (budget reached: free targets only)' : ''}` : ''}`);
   const rows = Object.entries(st.targets).sort(([a], [b]) => a.localeCompare(b));
   if (rows.length) {
     const w = Math.max(...rows.map(([id]) => id.length));
@@ -1207,11 +1247,15 @@ button { font: inherit; cursor: pointer; }
 
 .numbers { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); margin: 0 0 16px; background: var(--panel);
   border: 1px solid var(--rule); border-radius: 14px; }
-.numbers div { padding: 18px 22px; }
-.numbers div + div { border-left: 1px solid var(--rule); }
+.numbers > div { padding: 18px 22px; }
+.numbers > div + div { border-left: 1px solid var(--rule); }
 .numbers b { display: block; font-size: 32px; line-height: 1.1; font-weight: 700; letter-spacing: -.02em; font-variant-numeric: tabular-nums; }
 .numbers span { color: var(--soft); font-size: 14px; }
 .numbers .bad b { color: var(--stop); }
+.meter { height: 6px; border-radius: 3px; background: var(--rule); margin-top: 8px; overflow: hidden; }
+.meter i { display: block; height: 100%; background: var(--s-ok); border-radius: 3px; }
+.meter.full i { background: var(--stop); }
+.numbers small { display: block; color: var(--faint); font-size: 12px; margin-top: 4px; }
 
 .traffic { background: var(--panel); border: 1px solid var(--rule); border-radius: 14px; padding: 22px 26px 18px; margin: 0 0 64px; }
 .traffic header { display: flex; justify-content: space-between; align-items: baseline; gap: 12px 24px; flex-wrap: wrap; margin-bottom: 18px; }
@@ -1296,9 +1340,9 @@ td:first-child { font-family: var(--mono); font-size: 13px; }
   .hero { column-gap: 14px; }
   .signal { width: 16px; height: 16px; }
   .numbers { grid-template-columns: 1fr 1fr; }
-  .numbers div + div { border-left: 0; }
-  .numbers div:nth-child(even) { border-left: 1px solid var(--rule); }
-  .numbers div:nth-child(n+3) { border-top: 1px solid var(--rule); }
+  .numbers > div + div { border-left: 0; }
+  .numbers > div:nth-child(even) { border-left: 1px solid var(--rule); }
+  .numbers > div:nth-child(n+3) { border-top: 1px solid var(--rule); }
   .line { padding: 18px 18px 8px; }
   .traffic { padding: 18px 16px 14px; }
   .bars { gap: 1px; }
@@ -1326,6 +1370,8 @@ const T = {
     blockedText: ' Every station on this line is paused or down, so its requests fail until one reopens.',
     downText: 'Start it again with the command <span class="code">bascule</span>. This page reconnects on its own.',
     availability: 'Availability', answered: 'Requests answered', switched: 'Rerouted', failed: 'Failed', speed: 'Average response time', tokens: 'Tokens processed', cached: 'Answered from cache',
+    spent: 'Spent today', of: (b) => 'Budget ' + b + ' a day', free: 'Free models only', capTitle: 'Daily budget reached.',
+    capText: (b) => 'Today’s spend has reached ' + b + '. Until midnight, requests go to free models only; paid stations are closed.', capped: 'Closed: budget reached', cost: 'Cost today',
     trafficTitle: 'Traffic, last hour', trafficLead: 'Requests per minute.', ago: (m) => m + ' min ago', nowLabel: 'now',
     sOk: 'Answered directly', sRerouted: 'Answered after reroute', sFailed: 'Failed', tipMin: (t) => t, avgMs: (ms) => ms + ' ms on average',
     linesTitle: 'Lines', linesLead: 'A request stops at the first open station. If it is busy or down, the request continues to the next one.',
@@ -1348,6 +1394,8 @@ const T = {
     blockedText: ' Toutes les stations de cette ligne sont en pause ou en panne : ses demandes échouent jusqu’à la réouverture de l’une d’elles.',
     downText: 'Relancez-le avec la commande <span class="code">bascule</span>. Cette page se reconnecte d’elle-même.',
     availability: 'Disponibilité', answered: 'Demandes servies', switched: 'Déviées', failed: 'Échecs', speed: 'Temps de réponse moyen', tokens: 'Tokens traités', cached: 'Servies depuis le cache',
+    spent: 'Dépensé aujourd’hui', of: (b) => 'Budget ' + b + ' par jour', free: 'Modèles gratuits uniquement', capTitle: 'Budget du jour atteint.',
+    capText: (b) => 'La dépense du jour a atteint ' + b + '. Jusqu’à minuit, les demandes vont uniquement vers les modèles gratuits ; les stations payantes sont fermées.', capped: 'Fermée : budget atteint', cost: 'Coût du jour',
     trafficTitle: 'Trafic de la dernière heure', trafficLead: 'Demandes par minute.', ago: (m) => 'il y a ' + m + ' min', nowLabel: 'maintenant',
     sOk: 'Servies directement', sRerouted: 'Servies après déviation', sFailed: 'Échouées', tipMin: (t) => t, avgMs: (ms) => ms + ' ms en moyenne',
     linesTitle: 'Lignes', linesLead: 'Une demande s’arrête à la première station ouverte. Si elle est occupée ou en panne, la demande continue vers la suivante.',
@@ -1371,6 +1419,7 @@ const fmt = (n) => Math.round(Number(n || 0)).toLocaleString(lang);
 const dur = (s) => s >= 86400 ? Math.floor(s / 86400) + (lang === 'fr' ? ' j ' : ' d ') + Math.floor(s % 86400 / 3600) + ' h'
   : s >= 3600 ? Math.floor(s / 3600) + ' h ' + Math.floor(s % 3600 / 60) + ' min' : s >= 60 ? Math.floor(s / 60) + ' min' : s + ' s';
 const endpoint = location.origin + '/v1';
+const usd = (v) => new Intl.NumberFormat(lang, { style: 'currency', currency: 'USD', currencyDisplay: 'narrowSymbol', minimumFractionDigits: 2, maximumFractionDigits: v > 0 && v < 0.01 ? 4 : 2 }).format(v);
 const still = matchMedia('(prefers-reduced-motion: reduce)');
 const LINE_COLORS = ['#2455d8', '#7a3fc4', '#0b7f8a', '#b8406f', '#8a5a1f', '#3b5b86'];
 
@@ -1400,13 +1449,14 @@ function stateOf(t) {
 }
 // Several keys per model: the station is open while one key is.
 function station(st, id) {
+  if (st.cost?.capped && st.cost.priced.includes(id)) return { s: 'wait', capped: true };
   const ks = Object.entries(st.targets).filter(([hid]) => hid.startsWith(id + '#')).map(([, t]) => t);
   if (!ks.length) return { s: 'idle' };
   for (const s of ['go', 'idle']) { const t = ks.find((k) => stateOf(k) === s); if (t) return { s, t }; }
   const t = ks.filter((k) => k.coolingForS).sort((a, b) => a.coolingForS - b.coolingForS)[0];
   return t ? { s: 'wait', t } : { s: 'stopped', t: ks[0] };
 }
-const say = (s, t) => s === 'wait' ? L.wait(dur(t.coolingForS)) : L[s];
+const say = (s, t, capped) => capped ? L.capped : s === 'wait' ? L.wait(dur(t.coolingForS)) : L[s];
 const split = (id) => { const i = id.indexOf('/'); return [id.slice(0, i), id.slice(i + 1)]; };
 
 // Numbers glide to their new value instead of jumping.
@@ -1464,12 +1514,12 @@ function render(st) {
   for (const [name, line] of Object.entries(built)) {
     let head = null;
     for (const x of line.stops) {
-      const { s, t } = station(st, x.id);
+      const { s, t, capped } = station(st, x.id);
       if (!head && (s === 'go' || s === 'idle')) head = x;
       if (s === 'wait' || s === 'stopped') paused.add(x.id);
       x.li.classList.remove('go', 'wait', 'stopped', 'idle', 'head');
       x.li.classList.add(s);
-      x.how.textContent = say(s, t);
+      x.how.textContent = say(s, t, capped);
     }
     if (head && station(st, head.id).s === 'go') head.li.classList.add('head');
     line.sec.classList.toggle('blocked', !head && line.stops.length > 0);
@@ -1491,7 +1541,8 @@ function render(st) {
 
   const answered = st.requests - st.failures, sum = L.summary(dur(st.uptimeS), fmt(answered), fmt(st.fallbacks));
   let title, text, level;
-  if (blocked.length) { level = 'bad'; title = L.suspended(blocked.join(', ')); text = (st.requests ? sum : '') + L.blockedText; }
+  if (st.cost?.capped && !blocked.length) { level = 'warn'; title = L.capTitle; text = L.capText(usd(st.cost.budgetUsd)); }
+  else if (blocked.length) { level = 'bad'; title = L.suspended(blocked.join(', ')); text = (st.requests ? sum : '') + L.blockedText; }
   else if (!st.requests) { level = 'idle'; title = L.idleTitle; text = L.idleText; }
   else if (paused.size) { level = 'warn'; title = L.delays; text = sum + L.detourText(paused.size); }
   else { level = 'ok'; title = L.good; text = sum; }
@@ -1504,7 +1555,7 @@ function render(st) {
   const nums = [['availability', st.requests ? answered / st.requests * 100 : null, (v) => v === null ? '–' : (v >= 99.95 ? '100' : v.toLocaleString(lang, { maximumFractionDigits: 1 })) + ' %'],
     ['answered', answered], ['switched', st.fallbacks], ['failed', st.failures],
     ['speed', avg, (v) => v === null ? '–' : v < 1000 ? fmt(v) + ' ms' : (v / 1000).toLocaleString(lang, { maximumFractionDigits: 1 }) + ' s'],
-    ['tokens', st.tokens.prompt + st.tokens.completion], ...(st.cacheHits ? [['cached', st.cacheHits]] : [])];
+    ['spent', st.cost?.usd || 0, usd], ...(st.cacheHits ? [['cached', st.cacheHits]] : [])];
   if ($('numbers').dataset.shape !== nums.map((n) => n[0]).join()) {
     $('numbers').dataset.shape = nums.map((n) => n[0]).join();
     $('numbers').replaceChildren(...nums.map(([k]) => { const d = el('div', '', el('b'), el('span', '', L[k])); d.id = 'n-' + k; return d; }));
@@ -1514,16 +1565,24 @@ function render(st) {
     d.classList.toggle('bad', (k === 'failed' && v > 0) || (k === 'availability' && v !== null && v < 95));
     if (f) d.firstChild.textContent = f(v); else count(d.firstChild, Math.round(v));
   }
+  const sp = $('n-spent'), b = st.cost?.budgetUsd;
+  sp.classList.toggle('bad', !!st.cost?.capped);
+  let meter = sp.querySelector('.meter');
+  if (b && !meter) { meter = el('div', 'meter', el('i')); sp.append(meter, el('small', 'budget')); }
+  if (!b && meter) { meter.remove(); sp.querySelector('.budget').remove(); }
+  if (b) sp.querySelector('.budget').textContent = L.of(usd(b));
+  if (b) { meter.firstChild.style.width = Math.min(100, st.cost.usd / b * 100) + '%'; meter.classList.toggle('full', !!st.cost.capped); }
   chart(tl, st.now);
 
   const rows = Object.entries(st.targets).sort(([a], [b]) => a.localeCompare(b));
   $('details').hidden = !rows.length;
   $('thead').replaceChildren(el('tr', '', el('th', '', L.model), el('th', '', L.state), el('th', 'num', L.ok), el('th', 'num', L.err),
-    el('th', 'num', L.latency), el('th', 'num', L.limit), el('th', '', L.cannot)));
+    el('th', 'num', L.latency), el('th', 'num', L.cost), el('th', 'num', L.limit), el('th', '', L.cannot)));
   $('tbody').replaceChildren(...rows.map(([hid, t]) => {
     const s = stateOf(t), base = hid.replace(/^[a-z]+:/, '').replace(/#[0-9]+$/, '');
-    return el('tr', '', el('td', '', hid), el('td', '', say(s, t)), el('td', 'num', fmt(t.ok)), el('td', 'num', fmt(t.err)),
-      el('td', 'num', t.ok ? t.latencyMs + ' ms' : '–'), el('td', 'num', t.learnedRpm ? t.learnedRpm + L.perMin : ''),
+    const closed = st.cost?.capped && st.cost.priced.includes(base);
+    return el('tr', '', el('td', '', hid), el('td', '', say(closed ? 'wait' : s, t, closed)), el('td', 'num', fmt(t.ok)), el('td', 'num', fmt(t.err)),
+      el('td', 'num', t.ok ? t.latencyMs + ' ms' : '–'), el('td', 'num', st.cost?.byTarget[base] ? usd(st.cost.byTarget[base]) : '–'), el('td', 'num', t.learnedRpm ? t.learnedRpm + L.perMin : ''),
       el('td', '', (st.cannot[base] || []).map((c) => L[c] || c).join(', ')));
   }));
 }
@@ -1540,7 +1599,7 @@ function chart(tl, now) {
   minutes = Array.from({ length: 60 }, (_, i) => byMin.get(last - 59 + i) || { t: (last - 59 + i) * 60000, ok: 0, rerouted: 0, failed: 0, latencyMs: null });
   const max = niceMax(Math.max(...minutes.map((b) => b.ok + b.rerouted + b.failed)));
   $('gmax').style.top = '0'; $('gmax').firstChild.textContent = fmt(max);
-  $('gmid').style.top = '50%'; $('gmid').firstChild.textContent = fmt(max / 2);
+  $('gmid').style.top = '50%'; $('gmid').firstChild.textContent = (max / 2).toLocaleString(lang, { maximumFractionDigits: 1 });
   const bars = $('bars');
   if (bars.children.length !== 60) bars.replaceChildren(...minutes.map((_, i) => { const b = el('div', 'bar'); b.tabIndex = i === 59 ? 0 : -1; b.dataset.i = i; return b; }));
   minutes.forEach((m, i) => {

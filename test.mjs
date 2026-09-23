@@ -875,6 +875,42 @@ try {
       assert.equal(hits.textOnly, before, 'restarted router must remember t/m has no vision');
     } finally { c.kill(); }
   });
+  await test('costs are counted per price, the daily budget keeps only free targets, spend survives a restart', async () => {
+    const home = mkdtempSync(join(tmpdir(), 'bascule-cost-'));
+    const p6 = port + 5;
+    const cfgPath = join(home, 'config.json');
+    // echo answers with 5 prompt and 1 completion tokens: at $1M per million each, one answer costs $6.
+    writeFileSync(cfgPath, JSON.stringify({ port: p6, providers: { paid: { baseUrl: echo, keys: ['k'], models: ['m'] }, free: { baseUrl: echo, keys: ['k'], models: ['m'] } },
+      prices: { 'paid/*': [1e6, 1e6] }, budget: { dailyUsd: 5 }, combos: { mix: ['paid/m', 'free/m'], paidOnly: ['paid/m'] } }));
+    const start = async () => {
+      const c = spawn(process.execPath, [SERVER], { cwd: home, env: { ...env, BASCULE_CONFIG: cfgPath, BASCULE_HOME: home }, stdio: ['ignore', 'pipe', 'inherit'] });
+      await new Promise((ok) => c.stdout.once('data', ok));
+      return c;
+    };
+    const b6 = `http://127.0.0.1:${p6}`;
+    const ask = (model) => fetch(`${b6}/v1/chat/completions`, { method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model, messages: msg('cost') }) });
+    const cost = async () => (await (await fetch(`${b6}/stats`)).json()).cost;
+    let c = await start();
+    try {
+      assert.equal((await ask('mix')).headers.get('x-bascule-target'), 'paid/m');
+      let k = await cost();
+      assert.equal(k.usd, 6);
+      assert.equal(k.byTarget['paid/m'], 6);
+      assert.equal(k.capped, true);
+      assert.deepEqual(k.priced, ['paid/m']);
+      const r = await ask('mix');
+      assert.equal(r.headers.get('x-bascule-target'), 'free/m', 'over budget: paid target skipped');
+      await r.text();
+      assert.equal((await cost()).usd, 6, 'free target costs nothing');
+      const refused = await ask('paidOnly');
+      assert.equal(refused.status, 402);
+      assert.match((await refused.json()).error.message, /daily budget/);
+    } finally { c.kill('SIGTERM'); await new Promise((ok) => c.on('exit', ok)); }
+    c = await start();
+    try { assert.equal((await cost()).usd, 6, 'spend of the day survives a restart'); }
+    finally { c.kill(); }
+  });
   await test('SIGTERM stops the server within 5 s', async () => {
     const p2 = port + 1;
     const s2 = spawn(process.execPath, [SERVER], { cwd: dir, env: { ...env, BASCULE_PORT: String(p2) }, stdio: ['ignore', 'pipe', 'ignore'] });

@@ -73,6 +73,17 @@ Environment variables: `BASCULE_KEY`, `BASCULE_PORT`, `BASCULE_HOST`, `BASCULE_C
 
 Model IDs change often. The bundled list was checked on 2026-09-23. `bascule doctor` flags any model the provider no longer lists, and `--deep` shows the ones that list but do not answer.
 
+### Costs and daily budget
+
+Give prices to paid models and Bascule counts what you spend. Prices are in US dollars per million tokens, `[input, output]`, for one model or a whole provider:
+
+```json
+"prices": { "openai/gpt-6-sol": [1.25, 10], "anthropic/*": [3, 15] },
+"budget": { "dailyUsd": 2 }
+```
+
+Models without a price count as free. Once today's spend reaches `dailyUsd`, paid models are skipped until midnight (local time) and requests go to the free ones; a request that has only paid models left gets a 402 error. Today's spend survives restarts and shows in `bascule status` and on the dashboard. Copy prices from your provider's pricing page: Bascule does not guess them. Counts rely on the token usage each provider reports.
+
 ## Security
 
 - Listens on `127.0.0.1` only by default.
@@ -102,7 +113,7 @@ Une seule adresse locale, compatible OpenAI, devant tous tes fournisseurs d'IA. 
 2. `bascule init`, puis mettre tes clés API dans `~/.bascule/.env`.
 3. `bascule doctor` pour vérifier que tes clés marchent.
    Pour Claude Code : `ANTHROPIC_BASE_URL=http://127.0.0.1:20129 claude`.
-4. `bascule`, puis régler tes outils sur `http://127.0.0.1:20129/v1` avec le modèle `auto`. `bascule status` montre ce qui se passe, et `bascule dashboard` ouvre la même vue dans le navigateur, en direct.
+4. `bascule`, puis régler tes outils sur `http://127.0.0.1:20129/v1` avec le modèle `auto`. `bascule status` montre ce qui se passe, et `bascule dashboard` ouvre la même vue dans le navigateur, en direct. Pour suivre vos dépenses, indiquez les prix des modèles payants (`prices`, en dollars par million de tokens) et un plafond (`budget.dailyUsd`) : une fois le plafond du jour atteint, seuls les modèles gratuits sont utilisés jusqu'à minuit.
 
 Utilise seulement des comptes et des clés auxquels tu as droit : pas de comptes gratuits multiples, pas d'abonnement grand public utilisé comme clé API.
 
