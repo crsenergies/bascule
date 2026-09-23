@@ -734,6 +734,15 @@ function cacheSet(k, v) {
 const stats = { requests: 0, cacheHits: 0, fallbacks: 0, hedges: 0, failures: 0, tokens: { prompt: 0, completion: 0 } };
 // Answers per combo and target: the dashboard animates each new one along its line.
 const served = {};
+// Per-minute activity for the last hour, for the dashboard chart.
+const timeline = [];
+function tally(kind, ms) {
+  const m = Math.floor(Date.now() / 60_000);
+  let b = timeline.at(-1);
+  if (!b || b.m !== m) { timeline.push(b = { m, ok: 0, rerouted: 0, failed: 0, ms: 0, n: 0 }); if (timeline.length > 60) timeline.shift(); }
+  b[kind]++;
+  if (ms !== undefined) { b.ms += ms; b.n++; }
+}
 const addUsage = (u) => { if (u) { stats.tokens.prompt += u.prompt_tokens || 0; stats.tokens.completion += u.completion_tokens || 0; } };
 
 // ---------- routing ----------
@@ -771,11 +780,11 @@ async function route(res, body, { endpoint, requested, cacheable }) {
   const ck = cacheable && CACHE_MAX > 0 ? cacheKey({ endpoint, ...body, model: requested }) : null;
   if (ck) {
     const hit = cacheGet(ck);
-    if (hit) { stats.cacheHits++; log(200, requested, 'cache', t0, 0); return send(res, 200, shape(res, hit, requested), { 'x-bascule-cache': 'hit' }); }
+    if (hit) { stats.cacheHits++; tally('ok'); log(200, requested, 'cache', t0, 0); return send(res, 200, shape(res, hit, requested), { 'x-bascule-cache': 'hit' }); }
     const shared = inflight.get(ck);
     if (shared) {
       const out = await shared;
-      if (out) { stats.cacheHits++; log(200, requested, 'shared', t0, 0); return send(res, 200, shape(res, out, requested), { 'x-bascule-cache': 'shared' }); }
+      if (out) { stats.cacheHits++; tally('ok'); log(200, requested, 'shared', t0, 0); return send(res, 200, shape(res, out, requested), { 'x-bascule-cache': 'shared' }); }
     }
   }
   let share = null;
@@ -910,6 +919,7 @@ async function attempt(res, body, { endpoint, requested, targets: allTargets, ck
           send(res, 200, shape(res, out, requested), head);
         }
         success(k.hid, Date.now() - up.t0);
+        tally(tries > 1 ? 'rerouted' : 'ok', Date.now() - t0);
         if (Object.hasOwn(cfg.combos || {}, requested)) (served[requested] ??= {})[t.id] = (served[requested][t.id] || 0) + 1;
         log(200, requested, t.id, t0, tries - 1);
         return out;
@@ -960,6 +970,7 @@ async function attempt(res, body, { endpoint, requested, targets: allTargets, ck
     if (clientAbort.signal.aborted) return null;
   }
   stats.failures++;
+  tally('failed');
   // Tell the client when the first target frees up; OpenAI SDKs honour retry-after on a 429.
   const free = Math.min(...targets.flatMap((t) => keysFor(t, endpoint).map((k) => h(k.hid).until)));
   const retryIn = Math.ceil((free - Date.now()) / 1000);
@@ -1017,7 +1028,9 @@ function status() {
   const combos = Object.fromEntries(Object.entries(cfg.combos || {}).map(([name, c]) =>
     [name, (Array.isArray(c) ? c : c.targets || []).map((t) => parseTarget(t)?.id).filter(Boolean)]));
   return { version: VERSION, uptimeS: Math.round(process.uptime()), providers: Object.keys(providers), cannot,
-    cacheSize: cache.size, ...stats, combos, served, targets };
+    cacheSize: cache.size, ...stats, combos, served, targets, now: now,
+    timeline: timeline.filter((b) => b.m > now / 60_000 - 60).map((b) => ({ t: b.m * 60_000, ok: b.ok, rerouted: b.rerouted, failed: b.failed,
+      latencyMs: b.n ? Math.round(b.ms / b.n) : null })) };
 }
 
 function log(code, model, target, t0, fallbacks) {
@@ -1160,11 +1173,13 @@ const DASHBOARD_CSS = `
 :root { color-scheme: light dark;
   --paper: #f3f4f6; --panel: #ffffff; --ink: #0f1c2e; --soft: #5a6a7e; --faint: #8795a8; --rule: #dde2e9;
   --go: #16874a; --wait: #c77c02; --stop: #cc3a32; --idle: #b3bcc8;
+  --s-ok: #2455d8; --s-rerouted: #c77c02; --s-failed: #b42318;
   --sans: "Helvetica Neue", Helvetica, "Arial Nova", Arial, system-ui, sans-serif;
   --mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace; }
 @media (prefers-color-scheme: dark) {
   :root { --paper: #0c1522; --panel: #131f30; --ink: #eaf0f7; --soft: #a0b0c4; --faint: #71839b; --rule: #243349;
-    --go: #34b86d; --wait: #e6a23c; --stop: #ef5a50; --idle: #4d5d74; }
+    --go: #34b86d; --wait: #e6a23c; --stop: #ef5a50; --idle: #4d5d74;
+    --s-ok: #5b8def; --s-rerouted: #a88f10; --s-failed: #c93a52; }
 }
 * { box-sizing: border-box; }
 body { margin: 0; background: var(--paper); color: var(--ink); font: 16px/1.5 var(--sans); -webkit-font-smoothing: antialiased; }
@@ -1190,7 +1205,7 @@ button { font: inherit; cursor: pointer; }
 .hero p strong { color: var(--ink); font-weight: 600; }
 .code { font-family: var(--mono); font-size: .86em; background: var(--panel); border: 1px solid var(--rule); padding: 1px 6px; border-radius: 5px; color: var(--ink); white-space: nowrap; }
 
-.numbers { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); margin: 0 0 64px; background: var(--panel);
+.numbers { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); margin: 0 0 16px; background: var(--panel);
   border: 1px solid var(--rule); border-radius: 14px; }
 .numbers div { padding: 18px 22px; }
 .numbers div + div { border-left: 1px solid var(--rule); }
@@ -1198,6 +1213,27 @@ button { font: inherit; cursor: pointer; }
 .numbers span { color: var(--soft); font-size: 14px; }
 .numbers .bad b { color: var(--stop); }
 
+.traffic { background: var(--panel); border: 1px solid var(--rule); border-radius: 14px; padding: 22px 26px 18px; margin: 0 0 64px; }
+.traffic header { display: flex; justify-content: space-between; align-items: baseline; gap: 12px 24px; flex-wrap: wrap; margin-bottom: 18px; }
+.traffic h2 { font-size: 18px; margin: 0; }
+.traffic header p { margin: 0; color: var(--soft); font-size: 14px; }
+.keys { display: flex; flex-wrap: wrap; gap: 4px 18px; list-style: none; margin: 0; padding: 0; font-size: 13px; color: var(--soft); }
+.keys i { display: inline-block; width: 10px; height: 10px; border-radius: 3px; margin-right: 6px; vertical-align: -1px; }
+.k-ok i { background: var(--s-ok); } .k-rerouted i { background: var(--s-rerouted); } .k-failed i { background: var(--s-failed); }
+.plot { position: relative; height: 150px; margin-left: 34px; border-bottom: 1px solid var(--soft); }
+.grid-y { position: absolute; left: 0; right: 0; border-top: 1px dashed var(--rule); }
+.grid-y span { position: absolute; right: calc(100% + 8px); top: -9px; font-size: 12px; color: var(--faint); font-variant-numeric: tabular-nums; }
+.bars { position: absolute; inset: 0; display: flex; align-items: flex-end; gap: 2px; }
+.bar { flex: 1 1 0; height: 100%; display: flex; flex-direction: column-reverse; gap: 2px; position: relative; }
+.bar i { display: block; min-height: 2px; }
+.bar i:last-child { border-radius: 3px 3px 0 0; }
+.bar .ok { background: var(--s-ok); } .bar .rerouted { background: var(--s-rerouted); } .bar .failed { background: var(--s-failed); }
+.bar:hover, .bar:focus-visible { background: color-mix(in srgb, var(--ink) 6%, transparent); outline: 0; }
+.axis-x { display: flex; justify-content: space-between; margin: 6px 0 0 34px; font-size: 12px; color: var(--faint); }
+.tip { position: absolute; bottom: calc(100% + 8px); background: var(--ink); color: var(--paper); font-size: 13px; line-height: 1.45; padding: 8px 11px;
+  border-radius: 8px; white-space: nowrap; pointer-events: none; z-index: 3; transform: translateX(-50%); }
+.tip b { display: block; }
+.tip i { display: inline-block; width: 8px; height: 8px; border-radius: 2px; margin-right: 6px; }
 .section-head { display: flex; align-items: end; justify-content: space-between; gap: 16px; flex-wrap: wrap; margin-bottom: 20px; }
 h2 { font-size: 24px; letter-spacing: -.02em; margin: 0 0 4px; }
 .lead { color: var(--soft); margin: 0; max-width: 62ch; }
@@ -1264,6 +1300,8 @@ td:first-child { font-family: var(--mono); font-size: 13px; }
   .numbers div:nth-child(even) { border-left: 1px solid var(--rule); }
   .numbers div:nth-child(n+3) { border-top: 1px solid var(--rule); }
   .line { padding: 18px 18px 8px; }
+  .traffic { padding: 18px 16px 14px; }
+  .bars { gap: 1px; }
   .line header .count { margin-left: 0; width: 100%; }
   .stops { flex-direction: column; }
   .stop { flex: none; padding: 0 0 18px 44px; min-height: 48px; }
@@ -1287,12 +1325,14 @@ const T = {
     detourText: (n) => ' ' + n + (n > 1 ? ' stations are' : ' station is') + ' paused, so requests are rerouted to the next open one.',
     blockedText: ' Every station on this line is paused or down, so its requests fail until one reopens.',
     downText: 'Start it again with the command <span class="code">bascule</span>. This page reconnects on its own.',
-    answered: 'Requests answered', switched: 'Rerouted', failed: 'Failed', words: 'Words read', written: 'Words written', cached: 'Answered from memory',
+    availability: 'Availability', answered: 'Requests answered', switched: 'Rerouted', failed: 'Failed', speed: 'Average response time', tokens: 'Tokens processed', cached: 'Answered from cache',
+    trafficTitle: 'Traffic, last hour', trafficLead: 'Requests per minute.', ago: (m) => m + ' min ago', nowLabel: 'now',
+    sOk: 'Answered directly', sRerouted: 'Answered after reroute', sFailed: 'Failed', tipMin: (t) => t, avgMs: (ms) => ms + ' ms on average',
     linesTitle: 'Lines', linesLead: 'A request stops at the first open station. If it is busy or down, the request continues to the next one.',
     now: 'Now serving', blockedLine: 'No open station', served: (n) => n + ' answered',
     go: 'Open', wait: (s) => 'Back in ' + s, stopped: 'Down', idle: 'Not used yet',
     lgo: 'Open', lwait: 'Paused, reopens on its own', lstopped: 'Down, check the key', lidle: 'Not used yet',
-    connectTitle: 'Connect an application', connectText: (u) => 'Use <span class="code">' + u + '</span> as the OpenAI address, your access key as the API key, and <span class="code">auto</span> as the model.',
+    connectTitle: 'Connect an application', connectText: (u) => 'Use <span class="code">' + u + '</span> as the OpenAI-compatible address, your access key as the API key, and <span class="code">auto</span> as the model.',
     copy: 'Copy address', copied: 'Address copied',
     details: 'Technical details', model: 'Model and key', state: 'State', ok: 'Answered', err: 'Errors', latency: 'Response time', limit: 'Limit', cannot: 'Cannot handle',
     perMin: '/min', vision: 'images', tools: 'tools',
@@ -1302,21 +1342,23 @@ const T = {
     live: 'En direct', offline: 'Ne répond pas', up: 'actif depuis ',
     good: 'Trafic normal sur toutes les lignes.', delays: 'Trafic perturbé.', idleTitle: 'Prêt pour la première demande.',
     suspended: (n) => 'Trafic interrompu sur ' + n + '.', down: 'Bascule ne répond pas.',
-    idleText: 'Aucune demande pour l’instant. Branche une application avec l’adresse ci-dessous et les lignes s’allumeront.',
+    idleText: 'Aucune demande pour l’instant. Branchez une application avec l’adresse ci-dessous et les lignes s’allumeront.',
     summary: (up, ok, fb) => 'Depuis ' + up + ', <strong>' + ok + (ok === '1' ? ' demande servie' : ' demandes servies') + '</strong>' + (fb !== '0' ? ', dont <strong>' + fb + '</strong> arrivées à destination grâce à un changement de modèle.' : '.'),
     detourText: (n) => ' ' + n + (n > 1 ? ' stations sont en pause' : ' station est en pause') + ' : les demandes sont déviées vers la suivante ouverte.',
     blockedText: ' Toutes les stations de cette ligne sont en pause ou en panne : ses demandes échouent jusqu’à la réouverture de l’une d’elles.',
-    downText: 'Relance-le avec la commande <span class="code">bascule</span>. Cette page se reconnecte toute seule.',
-    answered: 'Demandes servies', switched: 'Déviées', failed: 'Échecs', words: 'Mots lus', written: 'Mots écrits', cached: 'Servies depuis la mémoire',
+    downText: 'Relancez-le avec la commande <span class="code">bascule</span>. Cette page se reconnecte d’elle-même.',
+    availability: 'Disponibilité', answered: 'Demandes servies', switched: 'Déviées', failed: 'Échecs', speed: 'Temps de réponse moyen', tokens: 'Tokens traités', cached: 'Servies depuis le cache',
+    trafficTitle: 'Trafic de la dernière heure', trafficLead: 'Demandes par minute.', ago: (m) => 'il y a ' + m + ' min', nowLabel: 'maintenant',
+    sOk: 'Servies directement', sRerouted: 'Servies après déviation', sFailed: 'Échouées', tipMin: (t) => t, avgMs: (ms) => ms + ' ms en moyenne',
     linesTitle: 'Lignes', linesLead: 'Une demande s’arrête à la première station ouverte. Si elle est occupée ou en panne, la demande continue vers la suivante.',
     now: 'Dessert', blockedLine: 'Aucune station ouverte', served: (n) => n + (n === '1' ? ' servie' : ' servies'),
     go: 'Ouverte', wait: (s) => 'Retour dans ' + s, stopped: 'En panne', idle: 'Pas encore utilisée',
-    lgo: 'Ouverte', lwait: 'En pause, rouvre toute seule', lstopped: 'En panne, vérifier la clé', lidle: 'Pas encore utilisée',
-    connectTitle: 'Brancher une application', connectText: (u) => 'Adresse OpenAI <span class="code">' + u + '</span>, ta clé d’accès comme clé API, et le modèle <span class="code">auto</span>.',
+    lgo: 'Ouverte', lwait: 'En pause, rouvre d’elle-même', lstopped: 'En panne, vérifier la clé', lidle: 'Pas encore utilisée',
+    connectTitle: 'Brancher une application', connectText: (u) => 'Adresse compatible OpenAI <span class="code">' + u + '</span>, votre clé d’accès comme clé API, et le modèle <span class="code">auto</span>.',
     copy: 'Copier l’adresse', copied: 'Adresse copiée',
     details: 'Détails techniques', model: 'Modèle et clé', state: 'État', ok: 'Servies', err: 'Erreurs', latency: 'Temps de réponse', limit: 'Limite', cannot: 'Ne gère pas',
     perMin: '/min', vision: 'images', tools: 'outils',
-    gateTitle: 'Ce tableau de bord est verrouillé.', gateText: 'Colle ta clé d’accès : la ligne BASCULE_KEY dans ~/.bascule/.env. La commande bascule dashboard l’ouvre déjà déverrouillé.',
+    gateTitle: 'Ce tableau de bord est verrouillé.', gateText: 'Saisissez votre clé d’accès : la ligne BASCULE_KEY du fichier ~/.bascule/.env. La commande bascule dashboard l’ouvre directement déverrouillé.',
     open: 'Déverrouiller', badKey: 'Cette clé ne correspond pas à BASCULE_KEY.', placeholder: 'Clé d’accès' },
 };
 const lang = (navigator.language || 'en').slice(0, 2);
@@ -1456,14 +1498,23 @@ function render(st) {
   $('signal').className = 'signal ' + level;
   $('title').textContent = title; $('text').innerHTML = text;
 
-  // About 0.75 English words per token: close enough to give a feel for the volume.
-  const nums = [['answered', answered], ['switched', st.fallbacks], ['failed', st.failures], ['words', st.tokens.prompt * 0.75],
-    ['written', st.tokens.completion * 0.75], ...(st.cacheHits ? [['cached', st.cacheHits]] : [])];
+  const tl = st.timeline || [], timed = tl.filter((b) => b.latencyMs !== null);
+  const w = timed.reduce((a, b) => a + b.ok + b.rerouted, 0);
+  const avg = w ? Math.round(timed.reduce((a, b) => a + b.latencyMs * (b.ok + b.rerouted), 0) / w) : null;
+  const nums = [['availability', st.requests ? answered / st.requests * 100 : null, (v) => v === null ? '–' : (v >= 99.95 ? '100' : v.toLocaleString(lang, { maximumFractionDigits: 1 })) + ' %'],
+    ['answered', answered], ['switched', st.fallbacks], ['failed', st.failures],
+    ['speed', avg, (v) => v === null ? '–' : v < 1000 ? fmt(v) + ' ms' : (v / 1000).toLocaleString(lang, { maximumFractionDigits: 1 }) + ' s'],
+    ['tokens', st.tokens.prompt + st.tokens.completion], ...(st.cacheHits ? [['cached', st.cacheHits]] : [])];
   if ($('numbers').dataset.shape !== nums.map((n) => n[0]).join()) {
     $('numbers').dataset.shape = nums.map((n) => n[0]).join();
     $('numbers').replaceChildren(...nums.map(([k]) => { const d = el('div', '', el('b'), el('span', '', L[k])); d.id = 'n-' + k; return d; }));
   }
-  for (const [k, v] of nums) { const d = $('n-' + k); d.classList.toggle('bad', k === 'failed' && v > 0); count(d.firstChild, Math.round(v)); }
+  for (const [k, v, f] of nums) {
+    const d = $('n-' + k);
+    d.classList.toggle('bad', (k === 'failed' && v > 0) || (k === 'availability' && v !== null && v < 95));
+    if (f) d.firstChild.textContent = f(v); else count(d.firstChild, Math.round(v));
+  }
+  chart(tl, st.now);
 
   const rows = Object.entries(st.targets).sort(([a], [b]) => a.localeCompare(b));
   $('details').hidden = !rows.length;
@@ -1476,6 +1527,52 @@ function render(st) {
       el('td', '', (st.cannot[base] || []).map((c) => L[c] || c).join(', ')));
   }));
 }
+
+const SERIES = [['ok', 'sOk'], ['rerouted', 'sRerouted'], ['failed', 'sFailed']];
+$('traffic-title').textContent = L.trafficTitle; $('traffic-lead').textContent = L.trafficLead;
+$('keys').replaceChildren(...SERIES.map(([k, l]) => el('li', 'k-' + k, el('i'), L[l])));
+$('x0').textContent = L.ago(60); $('x1').textContent = L.ago(30); $('x2').textContent = L.nowLabel;
+const niceMax = (v) => { if (v <= 4) return 4; const p = 10 ** Math.floor(Math.log10(v)), m = v / p; return (m <= 2 ? 2 : m <= 5 ? 5 : 10) * p; };
+const hhmm = (t) => new Date(t).toLocaleTimeString(lang, { hour: '2-digit', minute: '2-digit' });
+let minutes = [];
+function chart(tl, now) {
+  const last = Math.floor(now / 60000), byMin = new Map(tl.map((b) => [Math.floor(b.t / 60000), b]));
+  minutes = Array.from({ length: 60 }, (_, i) => byMin.get(last - 59 + i) || { t: (last - 59 + i) * 60000, ok: 0, rerouted: 0, failed: 0, latencyMs: null });
+  const max = niceMax(Math.max(...minutes.map((b) => b.ok + b.rerouted + b.failed)));
+  $('gmax').style.top = '0'; $('gmax').firstChild.textContent = fmt(max);
+  $('gmid').style.top = '50%'; $('gmid').firstChild.textContent = fmt(max / 2);
+  const bars = $('bars');
+  if (bars.children.length !== 60) bars.replaceChildren(...minutes.map((_, i) => { const b = el('div', 'bar'); b.tabIndex = i === 59 ? 0 : -1; b.dataset.i = i; return b; }));
+  minutes.forEach((m, i) => {
+    const col = bars.children[i];
+    col.setAttribute('aria-label', hhmm(m.t) + ': ' + SERIES.map(([k, l]) => L[l] + ' ' + m[k]).join(', '));
+    col.replaceChildren(...SERIES.filter(([k]) => m[k]).map(([k]) => { const seg = el('i', k); seg.style.height = (m[k] / max * 100) + '%'; return seg; }));
+  });
+  if (!$('tip').hidden && tipAt >= 0) tip(tipAt);
+}
+let tipAt = -1;
+function tip(i) {
+  const m = minutes[i], col = $('bars').children[i], box = $('tip');
+  if (!m || !col) return;
+  tipAt = i;
+  box.replaceChildren(el('b', '', hhmm(m.t)), ...SERIES.map(([k, l]) => { const r = el('div', '', el('i', ''), L[l] + (lang === 'fr' ? ' : ' : ': ') + m[k]); r.firstChild.style.background = 'var(--s-' + k + ')'; return r; }),
+    ...(m.latencyMs !== null ? [el('div', '', L.avgMs(fmt(m.latencyMs)))] : []));
+  box.hidden = false;
+  const plot = $('plot').getBoundingClientRect(), c = col.getBoundingClientRect(), half = box.offsetWidth / 2;
+  box.style.left = Math.min(Math.max(c.left - plot.left + c.width / 2, half), plot.width - half) + 'px';
+}
+$('bars').addEventListener('pointerover', (e) => { const c = e.target.closest('.bar'); if (c) tip(Number(c.dataset.i)); });
+$('bars').addEventListener('pointerleave', () => { $('tip').hidden = true; tipAt = -1; });
+$('bars').addEventListener('focusin', (e) => tip(Number(e.target.dataset.i)));
+$('bars').addEventListener('focusout', () => { $('tip').hidden = true; tipAt = -1; });
+$('bars').addEventListener('keydown', (e) => {
+  const d = { ArrowLeft: -1, ArrowRight: 1 }[e.key];
+  if (!d) return;
+  e.preventDefault();
+  const next = $('bars').children[Math.min(59, Math.max(0, tipAt + d))];
+  for (const c of $('bars').children) c.tabIndex = -1;
+  next.tabIndex = 0; next.focus();
+});
 
 function show(view) { for (const v of ['gate', 'app']) $(v).hidden = v !== view; }
 async function poll() {
@@ -1516,6 +1613,11 @@ const DASHBOARD = `<!doctype html>
 <div id="app" hidden>
   <section class="hero" aria-live="polite"><span id="signal" class="signal" aria-hidden="true"></span><h1 id="title"></h1><p id="text"></p></section>
   <div class="numbers" id="numbers"></div>
+  <section class="traffic" aria-labelledby="traffic-title">
+    <header><div><h2 id="traffic-title"></h2><p id="traffic-lead"></p></div><ul class="keys" id="keys"></ul></header>
+    <div class="plot" id="plot"><div class="grid-y" id="gmax"><span></span></div><div class="grid-y" id="gmid"><span></span></div><div class="bars" id="bars"></div><div class="tip" id="tip" hidden></div></div>
+    <div class="axis-x"><span id="x0"></span><span id="x1"></span><span id="x2"></span></div>
+  </section>
   <div class="section-head"><div><h2 id="lines-title"></h2><p class="lead" id="lines-lead"></p></div><ul class="legend" id="legend"></ul></div>
   <div id="lines"></div>
   <section class="connect"><div><h3 id="connect-title"></h3><p id="connect-text"></p></div><button id="copy" type="button"></button></section>

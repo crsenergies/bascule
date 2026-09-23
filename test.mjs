@@ -229,6 +229,15 @@ try {
     const st = await stats();
     assert.deepEqual(st.combos.hedge, ['tortoise/m', 'fast/m']);
   });
+  await test('stats keep a per-minute timeline of outcomes', async () => {
+    const sum = (st) => st.timeline.reduce((a, b) => a + b.ok + b.rerouted + b.failed, 0);
+    const before = sum(await stats());
+    assert.equal((await post({ model: 'echo/m', messages: msg('timeline') })).status, 200);
+    const st = await stats();
+    assert.equal(sum(st), before + 1);
+    assert.ok(st.timeline.length <= 60);
+    assert.ok(Number.isFinite(st.timeline.at(-1).latencyMs));
+  });
   await test('stats count answers per combo and target', async () => {
     const total = (st) => Object.values(st.served.nohedge || {}).reduce((a, b) => a + b, 0);
     const before = total(await stats());
