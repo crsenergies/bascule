@@ -1358,6 +1358,7 @@ if (arg === 'dashboard') {
 // open one. Every answer seen since the last refresh runs along its line as a small train.
 const DASHBOARD_CSS = `
 :root { color-scheme: light dark;
+  --night: #0c1a33; --night-ink: #eaf1fb; --night-soft: #97a9c4; --night-line: rgba(255,255,255,.09);
   --bg: #f4f5f7; --panel: #ffffff; --sunk: #f8f9fb; --ink: #111c2d; --soft: #566477; --faint: #8a96a6; --rule: #e1e5eb; --rule2: #eceff3;
   --go: #15803d; --wait: #b76e00; --stop: #c9302c; --idle: #aab4c1; --brand: #2455d8;
   --s-ok: #2455d8; --s-rerouted: #c77c02; --s-failed: #b42318;
@@ -1375,19 +1376,20 @@ body { margin: 0; background: var(--bg); color: var(--ink); font: 15px/1.5 var(-
 button { font: inherit; cursor: pointer; }
 .wrap { max-width: 1200px; margin: 0 auto; padding: 0 28px; }
 
-.bar { position: sticky; top: 0; z-index: 10; background: color-mix(in srgb, var(--panel) 92%, transparent); backdrop-filter: blur(8px);
-  border-bottom: 1px solid var(--rule); }
+.bar { position: sticky; top: 0; z-index: 10; background: color-mix(in srgb, var(--night) 94%, transparent); backdrop-filter: blur(8px); color: var(--night-ink);
+  border-bottom: 1px solid var(--night-line); }
 .bar .wrap { display: flex; align-items: center; gap: 28px; height: 58px; }
-.brand { display: flex; align-items: center; gap: 9px; font-weight: 700; font-size: 17px; letter-spacing: -.01em; color: var(--ink); text-decoration: none; }
+.brand { display: flex; align-items: center; gap: 9px; font-weight: 700; font-size: 17px; letter-spacing: -.01em; color: var(--night-ink); text-decoration: none; }
 .brand svg { width: 24px; height: 24px; }
 nav { display: flex; gap: 4px; }
-nav a { color: var(--soft); text-decoration: none; font-size: 14px; padding: 6px 10px; border-radius: 6px; }
-nav a:hover { color: var(--ink); background: var(--sunk); }
-.meta { margin-left: auto; color: var(--soft); font-size: 13px; display: flex; align-items: center; gap: 8px; white-space: nowrap; font-variant-numeric: tabular-nums; }
+nav a { color: var(--night-soft); text-decoration: none; font-size: 14px; padding: 6px 10px; border-radius: 6px; }
+nav a:hover { color: var(--night-ink); background: rgba(255,255,255,.07); }
+.meta { margin-left: auto; color: var(--night-soft); font-size: 13px; display: flex; align-items: center; gap: 8px; white-space: nowrap; font-variant-numeric: tabular-nums; }
 .pulse { width: 8px; height: 8px; border-radius: 50%; background: var(--go); box-shadow: 0 0 0 3px color-mix(in srgb, var(--go) 22%, transparent); }
 .pulse.down { background: var(--stop); box-shadow: 0 0 0 3px color-mix(in srgb, var(--stop) 22%, transparent); }
 
-main.wrap { padding-top: 24px; padding-bottom: 56px; }
+main.wrap { padding-top: 0; padding-bottom: 56px; }
+.gate { position: relative; z-index: 1; }
 .card { background: var(--panel); border: 1px solid var(--rule); border-radius: 12px; }
 .card-head { display: flex; align-items: baseline; justify-content: space-between; gap: 8px 20px; flex-wrap: wrap; padding: 18px 22px 0; }
 .card-head h2 { font-size: 16px; margin: 0; letter-spacing: -.01em; }
@@ -1395,18 +1397,41 @@ main.wrap { padding-top: 24px; padding-bottom: 56px; }
 h2.section { font-size: 20px; letter-spacing: -.02em; margin: 44px 0 4px; }
 p.section { color: var(--soft); margin: 0 0 16px; max-width: 70ch; font-size: 14px; }
 
-.status { display: grid; grid-template-columns: auto 1fr auto; gap: 4px 16px; align-items: center; padding: 20px 22px; }
+.band { background: var(--night); color: var(--night-ink); padding: 34px 0 96px;
+  background-image: radial-gradient(rgba(255,255,255,.055) 1px, transparent 1.2px), radial-gradient(ellipse 60% 80% at 70% 40%, rgba(64,120,240,.22), transparent 70%);
+  background-size: 22px 22px, 100% 100%; }
+.status { display: grid; grid-template-columns: auto 1fr auto; gap: 6px 16px; align-items: center; }
+.band .signal { align-self: start; margin-top: .6em; }
 .signal { grid-row: span 2; width: 14px; height: 14px; border-radius: 50%; background: var(--go); box-shadow: 0 0 0 5px color-mix(in srgb, var(--go) 18%, transparent); }
 .signal.warn { background: var(--wait); box-shadow: 0 0 0 5px color-mix(in srgb, var(--wait) 20%, transparent); }
 .signal.bad { background: var(--stop); box-shadow: 0 0 0 5px color-mix(in srgb, var(--stop) 20%, transparent); }
 .signal.idle { background: var(--idle); box-shadow: 0 0 0 5px color-mix(in srgb, var(--idle) 25%, transparent); }
-.status h1 { font-size: 22px; line-height: 1.25; letter-spacing: -.02em; margin: 0; }
-.status p { grid-column: 2; margin: 0; color: var(--soft); max-width: 90ch; }
-.status p strong { color: var(--ink); font-weight: 600; }
-.status .since { grid-row: 1 / span 2; grid-column: 3; text-align: right; color: var(--faint); font-size: 13px; font-variant-numeric: tabular-nums; }
+.status h1 { font-size: clamp(24px, 3.2vw, 34px); line-height: 1.15; letter-spacing: -.025em; margin: 0; }
+.status p { grid-column: 2; margin: 0; color: var(--night-soft); max-width: 80ch; font-size: 15px; }
+.status p strong { color: var(--night-ink); font-weight: 600; }
+.status .since { grid-row: 1 / span 2; grid-column: 3; text-align: right; color: var(--night-soft); font-size: 13px; font-variant-numeric: tabular-nums; }
+.status .code { background: rgba(255,255,255,.08); border-color: var(--night-line); color: var(--night-ink); }
+.net { margin-top: 18px; }
+.net svg { display: block; width: 100%; height: auto; overflow: visible; }
+.net .wire { fill: none; stroke: rgba(255,255,255,.13); stroke-width: 2; }
+.net .wire.go { stroke: rgba(63,185,111,.45); } .net .wire.wait { stroke: rgba(226,160,63,.45); stroke-dasharray: 5 6; } .net .wire.stopped { stroke: rgba(239,90,80,.4); stroke-dasharray: 2 6; }
+.net .feed { fill: none; stroke: rgba(120,165,255,.35); stroke-width: 2; }
+.net .node { fill: #132a52; stroke: #4a6ea8; stroke-width: 2.5; }
+.net .p.go .node { stroke: #3fb96f; } .net .p.wait .node { stroke: #e2a03f; } .net .p.stopped .node { stroke: #ef5a50; } .net .p.idle .node { stroke: #52627c; }
+.net .p .core { fill: #52627c; } .net .p.go .core { fill: #3fb96f; } .net .p.wait .core { fill: #e2a03f; } .net .p.stopped .core { fill: #ef5a50; }
+.net text { fill: var(--night-ink); font: 600 14px var(--sans); }
+.net text.sub { fill: var(--night-soft); font-weight: 400; font-size: 12px; font-variant-numeric: tabular-nums; }
+.net .p.wait text.sub { fill: #e2a03f; } .net .p.stopped text.sub { fill: #ef5a50; }
+.net .hub rect { fill: #1b3a73; stroke: #6b95f0; stroke-width: 2; }
+.net .hub.flash rect { animation: flash .5s ease-out; }
+@keyframes flash { from { fill: #3563c9; } to { fill: #1b3a73; } }
+.net .apps rect { fill: rgba(255,255,255,.06); stroke: rgba(255,255,255,.22); stroke-width: 1.5; stroke-dasharray: 4 4; }
+.net .spark-dot { fill: #9cc2ff; }
+.net .spark-dot.fail { fill: #ff7b72; }
 .code { font-family: var(--mono); font-size: .86em; background: var(--sunk); border: 1px solid var(--rule); padding: 1px 6px; border-radius: 5px; color: var(--ink); white-space: nowrap; }
 
-.kpis { display: grid; grid-template-columns: repeat(6, 1fr); margin-top: 20px; }
+.kpis { display: grid; grid-template-columns: repeat(6, 1fr); margin-top: -64px; position: relative; z-index: 1;
+  box-shadow: 0 12px 32px -12px rgba(12, 26, 51, .28); }
 .kpis > div { padding: 16px 20px 16px; min-width: 0; }
 .kpis > div + div { border-left: 1px solid var(--rule2); }
 .kpis span { display: block; color: var(--soft); font-size: 13px; }
@@ -1519,6 +1544,7 @@ footer { border-top: 1px solid var(--rule); color: var(--faint); font-size: 12px
 footer .wrap { display: flex; gap: 16px; flex-wrap: wrap; padding-top: 18px; padding-bottom: 28px; }
 
 .gate { max-width: 480px; margin: 12vh auto 0; padding: 28px; }
+@media (prefers-color-scheme: dark) { .band { background-color: #0a1730; } .bar { background: color-mix(in srgb, #0a1730 94%, transparent); } }
 .gate h1 { font-size: 22px; letter-spacing: -.02em; margin: 0 0 8px; }
 .gate p { color: var(--soft); margin: 0; font-size: 14px; }
 .gate form { display: flex; gap: 10px; flex-wrap: wrap; margin-top: 20px; }
@@ -1538,6 +1564,7 @@ footer .wrap { display: flex; gap: 16px; flex-wrap: wrap; padding-top: 18px; pad
   .meta .extra { display: none; }
   .status { grid-template-columns: auto 1fr; }
   .status .since { grid-column: 2; grid-row: auto; text-align: left; }
+  .band { padding: 24px 0 84px; }
   .kpis { grid-template-columns: 1fr 1fr; }
   .kpis > div:nth-child(n) { border-left: 0; border-top: 1px solid var(--rule2); }
   .kpis > div:nth-child(-n+2) { border-top: 0; }
@@ -1553,13 +1580,13 @@ footer .wrap { display: flex; gap: 16px; flex-wrap: wrap; padding-top: 18px; pad
   .stop:last-child::before { right: auto; bottom: calc(100% - 14px); }
   .train { top: 2px; left: 7px; width: 13px; height: 24px; }
 }
-@media (prefers-reduced-motion: reduce) { .train { display: none; } .arrive .dot { animation: none; } }
+@media (prefers-reduced-motion: reduce) { .net .spark-dot { display: none; } .net .hub.flash rect { animation: none; } .train { display: none; } .arrive .dot { animation: none; } }
 [hidden] { display: none !important; }
 `;
 const DASHBOARD_JS = `
 const T = {
   en: {
-    nav: ['Overview', 'Lines', 'Models', 'Connect'], live: 'Live', offline: 'Not answering', updated: 'updated ', since: 'Up for ',
+    nav: ['Overview', 'Lines', 'Models', 'Connect'], apps: 'Your apps', netLabel: (p) => 'Live map: your applications, bascule, and the providers ' + p, live: 'Live', offline: 'Not answering', updated: 'updated ', since: 'Up for ',
     good: 'Good service on all lines.', delays: 'Minor delays.', idleTitle: 'Ready for the first request.',
     suspended: (n) => 'Service suspended on ' + n + '.', down: 'Bascule is not answering.',
     idleText: 'Nothing has gone through yet. Connect an application with the details below and the lines will light up.',
@@ -1591,7 +1618,7 @@ const T = {
     gateTitle: 'This dashboard is locked.', gateText: 'Enter your access key: the BASCULE_KEY line in ~/.bascule/.env. The command bascule dashboard opens it already unlocked.',
     open: 'Unlock', badKey: 'This key does not match BASCULE_KEY.', placeholder: 'Access key' },
   fr: {
-    nav: ['Vue d’ensemble', 'Lignes', 'Modèles', 'Connexion'], live: 'En direct', offline: 'Ne répond pas', updated: 'mis à jour à ', since: 'Actif depuis ',
+    nav: ['Vue d’ensemble', 'Lignes', 'Modèles', 'Connexion'], apps: 'Vos applis', netLabel: (p) => 'Carte en direct : vos applications, bascule et les fournisseurs ' + p, live: 'En direct', offline: 'Ne répond pas', updated: 'mis à jour à ', since: 'Actif depuis ',
     good: 'Trafic normal sur toutes les lignes.', delays: 'Trafic perturbé.', idleTitle: 'Prêt pour la première demande.',
     suspended: (n) => 'Trafic interrompu sur ' + n + '.', down: 'Bascule ne répond pas.',
     idleText: 'Aucune demande pour l’instant. Branchez une application avec les informations ci-dessous et les lignes s’allumeront.',
@@ -1783,6 +1810,93 @@ function journal(st) {
   }));
 }
 
+// Live network map: your applications, bascule, and every provider. Each answer since the last
+// refresh travels as a dot from the applications through bascule to the provider that served it.
+const svgEl = (tag, attrs = {}, ...kids) => { const e = document.createElementNS(SVG, tag); for (const [k, v] of Object.entries(attrs)) e.setAttribute(k, v); e.append(...kids); return e; };
+let net = null, lastOk = null;
+function providersOf(st) {
+  const seen = [];
+  for (const ids of Object.values(st.combos || {})) for (const id of ids) { const p = split(id)[0]; if (!seen.includes(p)) seen.push(p); }
+  for (const hid of Object.keys(st.targets)) { const p = split(baseOf(hid))[0]; if (!seen.includes(p)) seen.push(p); }
+  return seen.slice(0, 8);
+}
+function buildNet(names) {
+  const narrow = $('net').clientWidth < 640;
+  const W = narrow ? 400 : 1000, rowH = narrow ? 50 : 54, H = Math.max(narrow ? 200 : 220, names.length * rowH + 20);
+  const ax = narrow ? 4 : 40, aw = narrow ? 84 : 150, hx = narrow ? 120 : 380, hw = narrow ? 96 : 150, px = narrow ? 262 : 700, cy = H / 2;
+  const svg = svgEl('svg', { viewBox: '0 0 ' + W + ' ' + H, 'aria-hidden': 'true' });
+  const feed = svgEl('path', { class: 'feed', d: 'M' + (ax + aw) + ',' + cy + 'L' + hx + ',' + cy });
+  const wires = svgEl('g'), dots = svgEl('g');
+  const apps = svgEl('g', { class: 'apps' }, svgEl('rect', { x: ax, y: cy - 26, width: aw, height: 52, rx: 12 }),
+    svgEl('text', { x: ax + aw / 2, y: cy + 5, 'text-anchor': 'middle' }, L.apps));
+  const hub = svgEl('g', { class: 'hub' }, svgEl('rect', { x: hx, y: cy - 30, width: hw, height: 60, rx: 14 }),
+    svgEl('text', { x: hx + hw / 2, y: cy + 6, 'text-anchor': 'middle' }, 'bascule'));
+  const nodes = {};
+  const g = svgEl('g');
+  names.forEach((name, i) => {
+    const y = 10 + rowH / 2 + i * rowH + (H - 20 - names.length * rowH) / 2;
+    const wire = svgEl('path', { class: 'wire', d: 'M' + (hx + hw) + ',' + cy + ' C' + (hx + hw + (px - hx - hw) * .55) + ',' + cy + ' ' + (px - (px - hx - hw) * .45) + ',' + y + ' ' + (px - 16) + ',' + y });
+    const sub = svgEl('text', { class: 'sub', x: px + 26, y: y + 15 });
+    const node = svgEl('g', { class: 'p idle' }, svgEl('circle', { class: 'node', cx: px, cy: y, r: 14 }), svgEl('circle', { class: 'core', cx: px, cy: y, r: 5 }),
+      svgEl('text', { x: px + 26, y: y - 2 }, name), sub);
+    wires.append(wire); g.append(node);
+    nodes[name] = { wire, node, sub };
+  });
+  svg.append(feed, wires, apps, hub, g, dots);
+  $('net').replaceChildren(svg);
+  $('net').setAttribute('aria-label', L.netLabel(names.join(', ')));
+  return { sig: names.join() + narrow, feed, hub, dots, nodes };
+}
+function fly(p, fail) {
+  if (still.matches || !net) return;
+  const legs = [net.feed, net.nodes[p].wire], lens = legs.map((l) => l.getTotalLength());
+  const total = lens[0] + lens[1], ms = 900 + total * 0.6;
+  const dot = svgEl('circle', { class: 'spark-dot' + (fail ? ' fail' : ''), r: 4.5 });
+  net.dots.append(dot);
+  const t0 = performance.now();
+  let flashed = false;
+  const step = (now) => {
+    const k = Math.min(1, (now - t0) / ms), e = k < .5 ? 2 * k * k : 1 - (-2 * k + 2) ** 2 / 2;
+    // A failed request stops a little way down the provider's wire and fades there.
+    const d = e * (fail ? lens[0] + lens[1] * .45 : total);
+    const pt = d <= lens[0] ? legs[0].getPointAtLength(d) : legs[1].getPointAtLength(d - lens[0]);
+    dot.setAttribute('cx', pt.x); dot.setAttribute('cy', pt.y);
+    dot.setAttribute('opacity', fail && k > .7 ? String((1 - k) / .3) : '1');
+    if (!flashed && d > lens[0]) { flashed = true; net.hub.classList.remove('flash'); void net.hub.getBBox(); net.hub.classList.add('flash'); }
+    if (k < 1) requestAnimationFrame(step); else dot.remove();
+  };
+  requestAnimationFrame(step);
+}
+function network(st) {
+  const names = providersOf(st);
+  const sig = names.join() + ($('net').clientWidth < 640);
+  if (!net || net.sig !== sig) net = buildNet(names);
+  const okNow = {}, errNow = {};
+  for (const name of names) {
+    const ks = Object.entries(st.targets).filter(([hid]) => split(baseOf(hid))[0] === name).map(([, t]) => t);
+    okNow[name] = ks.reduce((a, t) => a + t.ok, 0); errNow[name] = ks.reduce((a, t) => a + t.err, 0);
+    const states = ks.map(stateOf);
+    const s = states.includes('go') ? 'go' : states.includes('ready') ? 'idle' : states.includes('wait') ? 'wait' : states.includes('stopped') ? 'stopped' : 'idle';
+    const n = net.nodes[name];
+    n.node.setAttribute('class', 'p ' + s); n.wire.setAttribute('class', 'wire ' + s);
+    const timed = ks.filter((t) => t.ok);
+    const lat = timed.length ? Math.round(timed.reduce((a, t) => a + t.latencyMs * t.ok, 0) / okNow[name]) : null;
+    const soon = ks.filter((t) => t.coolingForS).sort((a, b) => a.coolingForS - b.coolingForS)[0];
+    n.sub.textContent = s === 'wait' ? L.wait(dur(soon.coolingForS)) : s === 'stopped' ? L.stopped
+      : okNow[name] ? L.served(fmt(okNow[name])) + (lat !== null ? ' · ' + fmt(lat) + ' ms' : '') : L.idle;
+  }
+  if (lastOk) {
+    let delay = 0;
+    for (const name of names) {
+      for (let k = 0; k < Math.min(4, okNow[name] - (lastOk.ok[name] || 0)); k++, delay += 260) setTimeout(() => fly(name, false), delay);
+      for (let k = 0; k < Math.min(2, errNow[name] - (lastOk.err[name] || 0)); k++, delay += 260) setTimeout(() => fly(name, true), delay);
+    }
+  }
+  lastOk = { ok: okNow, err: errNow };
+}
+let resizeTimer;
+addEventListener('resize', () => { clearTimeout(resizeTimer); resizeTimer = setTimeout(() => { net = null; poll(); }, 250); });
+
 function render(st) {
   $('meta').replaceChildren(el('span', 'pulse'), L.live, el('span', 'extra', '· ' + L.updated + clock(Date.now(), true)));
   const sig = JSON.stringify(st.combos || {});
@@ -1859,6 +1973,7 @@ function render(st) {
 
   chart(minutes);
   journal(st);
+  network(st);
 
   const rows = Object.entries(st.targets).sort(([a], [b]) => a.localeCompare(b));
   $('models-none').hidden = rows.length > 0; $('models-table').hidden = !rows.length;
@@ -1921,7 +2036,7 @@ $('bars').addEventListener('keydown', (e) => {
   next.tabIndex = 0; next.focus();
 });
 
-function show(view) { for (const v of ['gate', 'app']) $(v).hidden = v !== view; $('nav').hidden = view !== 'app'; }
+function show(view) { for (const v of ['gate', 'app']) $(v).hidden = v !== view; $('nav').hidden = $('band').hidden = view !== 'app'; }
 async function poll() {
   clearTimeout(poll.timer);
   try {
@@ -1938,7 +2053,7 @@ async function poll() {
     show('app');
     $('meta').replaceChildren(el('span', 'pulse down'), L.offline);
     $('signal').className = 'signal bad'; $('title').textContent = L.down; $('text').innerHTML = L.downText;
-    lastServed = null;
+    lastServed = null; lastOk = null;
   }
   poll.timer = setTimeout(poll, document.hidden ? 10000 : 1500);
 }
@@ -1954,13 +2069,16 @@ const DASHBOARD = `<!doctype html>
   <nav id="nav" hidden><a href="#overview"></a><a href="#lines-title"></a><a href="#models-title"></a><a href="#connect"></a></nav>
   <div class="meta" id="meta" aria-live="polite"></div>
 </div></header>
+<div class="band" id="band" hidden><div class="wrap">
+  <section id="overview" class="status" aria-live="polite"><span id="signal" class="signal" aria-hidden="true"></span><h1 id="title"></h1><p id="text"></p><span id="since" class="since"></span></section>
+  <div class="net" id="net" role="img"></div>
+</div></div>
 <main class="wrap">
 <section id="gate" class="card gate" hidden>
   <h1 id="gate-title"></h1><p id="gate-text"></p>
   <form id="keyform"><input id="keyinput" type="password" autocomplete="off" aria-labelledby="gate-text"><button id="open" type="submit"></button><p id="keymsg" class="msg" role="alert"></p></form>
 </section>
 <div id="app" hidden>
-  <section id="overview" class="card status" aria-live="polite"><span id="signal" class="signal" aria-hidden="true"></span><h1 id="title"></h1><p id="text"></p><span id="since" class="since"></span></section>
   <div class="card kpis" id="kpis"></div>
   <div class="grid2">
     <section class="card traffic" aria-labelledby="traffic-title">
