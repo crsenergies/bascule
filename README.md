@@ -13,7 +13,7 @@ One local OpenAI-compatible endpoint in front of all your AI providers. When one
 Needs Node.js 20 or newer.
 
 ```bash
-npm install -g bascule   # or clone the repo and run: node server.mjs
+npm install -g bascule-router   # the command is still `bascule`; or clone the repo and run: node server.mjs
 bascule init             # creates ~/.bascule/config.json and ~/.bascule/.env
 # put your API keys in ~/.bascule/.env (empty = provider disabled)
 bascule doctor           # checks every key and model; --deep sends one tiny request per model
@@ -113,7 +113,7 @@ They cover fallback for every error class, key rotation, timeouts, streaming fai
 
 Une seule adresse locale, compatible OpenAI, devant tous tes fournisseurs d'IA. Si l'un tombe ou atteint sa limite, la requête passe au suivant, jusqu'à un modèle Ollama local si tu veux. Un seul fichier, aucune dépendance.
 
-1. Installer Node.js 20+, puis `npm install -g bascule`.
+1. Installer Node.js 20+, puis `npm install -g bascule-router` (la commande reste `bascule`).
 2. `bascule init`, puis mettre tes clés API dans `~/.bascule/.env`.
 3. `bascule doctor` pour vérifier que tes clés marchent.
    Pour Claude Code : `ANTHROPIC_BASE_URL=http://127.0.0.1:8484 claude`.
