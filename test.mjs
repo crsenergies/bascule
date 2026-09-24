@@ -768,13 +768,22 @@ try {
   });
 
   console.log('load');
-  await test('300 concurrent requests all succeed', async () => {
-    const rs = await Promise.all(Array.from({ length: 300 }, (_, i) => post({ model: 'echo/m', messages: msg(`n${i}`) }).then((r) => r.json())));
-    assert.ok(rs.every((j, i) => j.choices?.[0].message.content === `echo:n${i}`));
-  });
-  await test('100 concurrent streams all complete', async () => {
-    const txts = await Promise.all(Array.from({ length: 100 }, () => post({ model: 'echo/m', stream: true, messages: msg() }).then((r) => r.text())));
-    assert.ok(txts.every((t) => t.endsWith('data: [DONE]\n\n')));
+  // Load runs on its own router with real-world timeouts: the main one uses 300-400 ms timeouts to
+  // test them, which a slow CI machine (Windows) can exceed under 300 requests at once.
+  await test('300 concurrent requests all succeed, 100 concurrent streams all complete', async () => {
+    const home = mkdtempSync(join(tmpdir(), 'bascule-load-'));
+    const p7 = port + 6;
+    writeFileSync(join(home, 'config.json'), JSON.stringify({ port: p7, log: false, providers: { e: { baseUrl: echo, keys: ['k'], models: ['m'] } } }));
+    const c = spawn(process.execPath, [SERVER], { cwd: home, env: { ...env, BASCULE_CONFIG: join(home, 'config.json'), BASCULE_HOME: home }, stdio: ['ignore', 'pipe', 'inherit'] });
+    await new Promise((ok) => c.stdout.once('data', ok));
+    const send = (body) => fetch(`http://127.0.0.1:${p7}/v1/chat/completions`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) });
+    try {
+      const rs = await Promise.all(Array.from({ length: 300 }, (_, i) => send({ model: 'e/m', messages: msg(`n${i}`) }).then((r) => r.json())));
+      const bad = rs.findIndex((j, i) => j.choices?.[0].message.content !== `echo:n${i}`);
+      assert.equal(bad, -1, bad < 0 ? '' : `request ${bad} got ${JSON.stringify(rs[bad]).slice(0, 200)}`);
+      const txts = await Promise.all(Array.from({ length: 100 }, () => send({ model: 'e/m', stream: true, messages: msg() }).then((r) => r.text())));
+      assert.ok(txts.every((t) => t.endsWith('data: [DONE]\n\n')));
+    } finally { c.kill(); }
   });
   // RSS after a burst reflects V8's heap high-water mark, not a leak. A leak shows as growth
   // that keeps going across identical rounds, so compare later rounds with the first.
