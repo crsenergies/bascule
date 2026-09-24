@@ -362,6 +362,11 @@ try {
     assert.ok(Date.now() - t0 >= 250, `waited ${Date.now() - t0} ms`);
     assert.equal(hits.flaky429, 2);
   });
+  await test('events journal records the pause and the recovery', async () => {
+    const evs = (await stats()).events.filter((e) => e.target === 'flaky429/m#0');
+    assert.deepEqual(evs.map((e) => e.kind), ['pause', 'back']);
+    assert.equal(evs[0].status, 429);
+  });
   await test('rpm budget moves the third call of the minute to the next target', async () => {
     const got = [];
     for (let i = 0; i < 3; i++) got.push((await post({ model: 'budgeted', messages: msg(`b${i}`) })).headers.get('x-bascule-target'));

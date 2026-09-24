@@ -129,6 +129,13 @@ function buildProviders(c) {
 }
 let providers = buildProviders(cfg);
 
+// Recent notable changes (pauses, recoveries, learned gaps, reloads, budget), newest last.
+const events = [];
+function event(kind, fields = {}) {
+  events.push({ t: Date.now(), kind, ...fields });
+  if (events.length > 50) events.shift();
+}
+
 // Swap in a new config only if it parses and builds; a typo while editing keeps the old one running.
 function reload(reason) {
   try {
@@ -141,8 +148,10 @@ function reload(reason) {
     applySettings();
     warmUp();
     console.log(`reloaded (${reason})  providers: ${Object.keys(providers).join(', ') || '(none)'}`);
+    event('reload');
   } catch (e) {
     console.error(`reload failed, keeping previous config: ${e.message}`);
+    event('reloadFailed', { detail: e.message.slice(0, 200) });
   }
 }
 
@@ -157,12 +166,14 @@ function cooldown(id, status, retryAfter) {
   let ms = retryAfter ? Math.max(retryAfter * 1000, 250) : Math.min(1000 * 2 ** Math.min(s.fails, 8), 5 * 60_000);
   if (status === 401 || status === 403) ms = 30 * 60_000; // bad key: park it
   if (status === 402) ms = 6 * 3600_000; // no credit on this account: nothing changes until someone pays
+  if (!s.paused) { s.paused = true; event('pause', { target: id, status, ms }); }
   s.until = Date.now() + ms;
   // A delay stated by the provider (or a dead key) is certain; a guessed backoff is not.
   s.hard = Boolean(retryAfter) || status === 401 || status === 402 || status === 403;
 }
 function success(id, ms) {
   const s = h(id);
+  if (s.paused) { s.paused = false; event('back', { target: id }); }
   s.fails = 0; s.until = 0; s.hard = false; s.ok++;
   s.lat = s.lat ? s.lat * 0.8 + ms * 0.2 : ms;
 }
@@ -775,7 +786,12 @@ function charge(t, u) {
 }
 const dailyBudget = () => Number(cfg.budget?.dailyUsd) || 0;
 // Once today's spend reaches the budget, only free targets are used until midnight.
-function capped() { rollover(); return dailyBudget() > 0 && spend.usd >= dailyBudget(); }
+function capped() {
+  rollover();
+  const now = dailyBudget() > 0 && spend.usd >= dailyBudget();
+  if (now && spend.notedDay !== spend.day) { spend.notedDay = spend.day; event('budget', { usd: dailyBudget() }); }
+  return now;
+}
 
 // ---------- routing ----------
 // Identical cacheable requests in flight share one upstream call.
@@ -922,7 +938,7 @@ async function attempt(res, body, { endpoint, requested, targets: allTargets, ck
       const cap = sizeLimit(status, String(e.message));
       if (cap) { Object.assign(h(k.hid), { maxTokens: cap, until: 0, fails: 0, hard: false }); permanent.add(t.id); return; }
       const miss = capabilityMiss(status, String(e.message), need);
-      if (miss) { lacksFor(t.id).add(miss); permanent.add(t.id); }
+      if (miss) { if (!lacksFor(t.id).has(miss)) event('learned', { target: t.id, cap: miss }); lacksFor(t.id).add(miss); permanent.add(t.id); }
       else if (status === 400 && GENERATION_FAILED.test(String(e.message))) { h(k.hid).until = 0; deadTargets.add(t.id); }
       else if (status === 404 || status === 400 || status === 413) permanent.add(t.id);
       else if (!keyLevel({ status })) deadTargets.add(t.id);
@@ -985,6 +1001,7 @@ async function attempt(res, body, { endpoint, requested, targets: allTargets, ck
         }
         const miss = capabilityMiss(status, String(e.message), need);
         if (miss) {
+          if (!lacksFor(t.id).has(miss)) event('learned', { target: t.id, cap: miss });
           lacksFor(t.id).add(miss);
           h(k.hid).until = 0; h(k.hid).fails = 0; // the target is fine, just not for this request
           permanent.add(t.id);
@@ -1062,14 +1079,14 @@ function listModels() {
 function status() {
   const now = Date.now();
   const targets = {};
-  for (const [id, s] of health) targets[id] = { ok: s.ok, err: s.err, latencyMs: Math.round(s.lat),
+  for (const [id, s] of health) targets[id] = { ok: s.ok, err: s.err, fails: s.fails, latencyMs: Math.round(s.lat),
     coolingForS: s.until > now ? Math.ceil((s.until - now) / 1000) : 0, ...(s.learnedRpm && { learnedRpm: s.learnedRpm }),
     ...(s.maxTokens && { maxTokens: s.maxTokens }) };
   const cannot = Object.fromEntries([...lacks].filter(([, c]) => c.size).map(([id, c]) => [id, [...c]]));
   const combos = Object.fromEntries(Object.entries(cfg.combos || {}).map(([name, c]) =>
     [name, (Array.isArray(c) ? c : c.targets || []).map((t) => parseTarget(t)?.id).filter(Boolean)]));
   return { version: VERSION, uptimeS: Math.round(process.uptime()), providers: Object.keys(providers), cannot,
-    cacheSize: cache.size, ...stats, combos, served, targets, now: now,
+    cacheSize: cache.size, ...stats, combos, served, targets, now: now, events,
     cost: { day: spend.day, usd: spend.usd, byTarget: spend.byTarget, budgetUsd: dailyBudget() || null, capped: capped(),
       priced: [...new Set(Object.values(cfg.combos || {}).flatMap((c) => Array.isArray(c) ? c : c.targets || []).map(parseTarget).filter((t) => t && priceOf(t)).map((t) => t.id))] },
     timeline: timeline.filter((b) => b.m > now / 60_000 - 60).map((b) => ({ t: b.m * 60_000, ok: b.ok, rerouted: b.rerouted, failed: b.failed,
@@ -1341,149 +1358,200 @@ if (arg === 'dashboard') {
 // open one. Every answer seen since the last refresh runs along its line as a small train.
 const DASHBOARD_CSS = `
 :root { color-scheme: light dark;
-  --paper: #f3f4f6; --panel: #ffffff; --ink: #0f1c2e; --soft: #5a6a7e; --faint: #8795a8; --rule: #dde2e9;
-  --go: #16874a; --wait: #c77c02; --stop: #cc3a32; --idle: #b3bcc8;
+  --bg: #f4f5f7; --panel: #ffffff; --sunk: #f8f9fb; --ink: #111c2d; --soft: #566477; --faint: #8a96a6; --rule: #e1e5eb; --rule2: #eceff3;
+  --go: #15803d; --wait: #b76e00; --stop: #c9302c; --idle: #aab4c1; --brand: #2455d8;
   --s-ok: #2455d8; --s-rerouted: #c77c02; --s-failed: #b42318;
   --sans: "Helvetica Neue", Helvetica, "Arial Nova", Arial, system-ui, sans-serif;
   --mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace; }
 @media (prefers-color-scheme: dark) {
-  :root { --paper: #0c1522; --panel: #131f30; --ink: #eaf0f7; --soft: #a0b0c4; --faint: #71839b; --rule: #243349;
-    --go: #34b86d; --wait: #e6a23c; --stop: #ef5a50; --idle: #4d5d74;
+  :root { --bg: #0b1320; --panel: #111b2b; --sunk: #0e1726; --ink: #e7edf5; --soft: #9dacbf; --faint: #6f8098; --rule: #1f2d42; --rule2: #182436;
+    --go: #3fb96f; --wait: #e2a03f; --stop: #ef5a50; --idle: #4a5a70; --brand: #6b95f0;
     --s-ok: #5b8def; --s-rerouted: #a88f10; --s-failed: #c93a52; }
 }
 * { box-sizing: border-box; }
-body { margin: 0; background: var(--paper); color: var(--ink); font: 16px/1.5 var(--sans); -webkit-font-smoothing: antialiased; }
-main { max-width: 1080px; margin: 0 auto; padding: 0 28px 72px; }
-:focus-visible { outline: 3px solid var(--ink); outline-offset: 3px; border-radius: 4px; }
+html { scroll-padding-top: 76px; }
+body { margin: 0; background: var(--bg); color: var(--ink); font: 15px/1.5 var(--sans); -webkit-font-smoothing: antialiased; }
+:focus-visible { outline: 2px solid var(--brand); outline-offset: 2px; border-radius: 4px; }
 button { font: inherit; cursor: pointer; }
+.wrap { max-width: 1200px; margin: 0 auto; padding: 0 28px; }
 
-.top { display: flex; align-items: center; gap: 12px; padding: 22px 0; border-bottom: 1px solid var(--rule); margin-bottom: 56px; }
-.brand { display: flex; align-items: center; gap: 10px; font-weight: 700; font-size: 19px; letter-spacing: -.01em; }
-.brand svg { width: 28px; height: 28px; }
-.meta { margin-left: auto; color: var(--soft); font-size: 14px; display: flex; align-items: center; gap: 8px; }
-.pulse { width: 8px; height: 8px; border-radius: 50%; background: var(--go); }
-.pulse.down { background: var(--stop); }
+.bar { position: sticky; top: 0; z-index: 10; background: color-mix(in srgb, var(--panel) 92%, transparent); backdrop-filter: blur(8px);
+  border-bottom: 1px solid var(--rule); }
+.bar .wrap { display: flex; align-items: center; gap: 28px; height: 58px; }
+.brand { display: flex; align-items: center; gap: 9px; font-weight: 700; font-size: 17px; letter-spacing: -.01em; color: var(--ink); text-decoration: none; }
+.brand svg { width: 24px; height: 24px; }
+nav { display: flex; gap: 4px; }
+nav a { color: var(--soft); text-decoration: none; font-size: 14px; padding: 6px 10px; border-radius: 6px; }
+nav a:hover { color: var(--ink); background: var(--sunk); }
+.meta { margin-left: auto; color: var(--soft); font-size: 13px; display: flex; align-items: center; gap: 8px; white-space: nowrap; font-variant-numeric: tabular-nums; }
+.pulse { width: 8px; height: 8px; border-radius: 50%; background: var(--go); box-shadow: 0 0 0 3px color-mix(in srgb, var(--go) 22%, transparent); }
+.pulse.down { background: var(--stop); box-shadow: 0 0 0 3px color-mix(in srgb, var(--stop) 22%, transparent); }
 
-.hero { display: grid; grid-template-columns: auto 1fr; column-gap: 22px; align-items: start; margin-bottom: 44px; }
-.signal { width: 22px; height: 22px; border-radius: 50%; margin-top: .32em; background: var(--go);
-  box-shadow: 0 0 0 6px color-mix(in srgb, var(--go) 18%, transparent); }
-.signal.warn { background: var(--wait); box-shadow: 0 0 0 6px color-mix(in srgb, var(--wait) 20%, transparent); }
-.signal.bad { background: var(--stop); box-shadow: 0 0 0 6px color-mix(in srgb, var(--stop) 20%, transparent); }
-.signal.idle { background: var(--idle); box-shadow: 0 0 0 6px color-mix(in srgb, var(--idle) 25%, transparent); }
-.hero h1 { font-size: clamp(30px, 5vw, 52px); line-height: 1.06; letter-spacing: -.03em; font-weight: 700; margin: 0 0 12px; max-width: 22ch; }
-.hero p { grid-column: 2; font-size: clamp(16px, 1.8vw, 19px); color: var(--soft); margin: 0; max-width: 62ch; }
-.hero p strong { color: var(--ink); font-weight: 600; }
-.code { font-family: var(--mono); font-size: .86em; background: var(--panel); border: 1px solid var(--rule); padding: 1px 6px; border-radius: 5px; color: var(--ink); white-space: nowrap; }
+main.wrap { padding-top: 24px; padding-bottom: 56px; }
+.card { background: var(--panel); border: 1px solid var(--rule); border-radius: 12px; }
+.card-head { display: flex; align-items: baseline; justify-content: space-between; gap: 8px 20px; flex-wrap: wrap; padding: 18px 22px 0; }
+.card-head h2 { font-size: 16px; margin: 0; letter-spacing: -.01em; }
+.card-head p { margin: 2px 0 0; color: var(--soft); font-size: 13px; }
+h2.section { font-size: 20px; letter-spacing: -.02em; margin: 44px 0 4px; }
+p.section { color: var(--soft); margin: 0 0 16px; max-width: 70ch; font-size: 14px; }
 
-.numbers { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); margin: 0 0 16px; background: var(--panel);
-  border: 1px solid var(--rule); border-radius: 14px; }
-.numbers > div { padding: 18px 22px; }
-.numbers > div + div { border-left: 1px solid var(--rule); }
-.numbers b { display: block; font-size: 32px; line-height: 1.1; font-weight: 700; letter-spacing: -.02em; font-variant-numeric: tabular-nums; }
-.numbers span { color: var(--soft); font-size: 14px; }
-.numbers .bad b { color: var(--stop); }
-.meter { height: 6px; border-radius: 3px; background: var(--rule); margin-top: 8px; overflow: hidden; }
-.meter i { display: block; height: 100%; background: var(--s-ok); border-radius: 3px; }
+.status { display: grid; grid-template-columns: auto 1fr auto; gap: 4px 16px; align-items: center; padding: 20px 22px; }
+.signal { grid-row: span 2; width: 14px; height: 14px; border-radius: 50%; background: var(--go); box-shadow: 0 0 0 5px color-mix(in srgb, var(--go) 18%, transparent); }
+.signal.warn { background: var(--wait); box-shadow: 0 0 0 5px color-mix(in srgb, var(--wait) 20%, transparent); }
+.signal.bad { background: var(--stop); box-shadow: 0 0 0 5px color-mix(in srgb, var(--stop) 20%, transparent); }
+.signal.idle { background: var(--idle); box-shadow: 0 0 0 5px color-mix(in srgb, var(--idle) 25%, transparent); }
+.status h1 { font-size: 22px; line-height: 1.25; letter-spacing: -.02em; margin: 0; }
+.status p { grid-column: 2; margin: 0; color: var(--soft); max-width: 90ch; }
+.status p strong { color: var(--ink); font-weight: 600; }
+.status .since { grid-row: 1 / span 2; grid-column: 3; text-align: right; color: var(--faint); font-size: 13px; font-variant-numeric: tabular-nums; }
+.code { font-family: var(--mono); font-size: .86em; background: var(--sunk); border: 1px solid var(--rule); padding: 1px 6px; border-radius: 5px; color: var(--ink); white-space: nowrap; }
+
+.kpis { display: grid; grid-template-columns: repeat(6, 1fr); margin-top: 20px; }
+.kpis > div { padding: 16px 20px 16px; min-width: 0; }
+.kpis > div + div { border-left: 1px solid var(--rule2); }
+.kpis span { display: block; color: var(--soft); font-size: 13px; }
+.kpis b { display: block; font-size: 26px; line-height: 1.2; font-weight: 700; letter-spacing: -.02em; font-variant-numeric: tabular-nums; margin-top: 4px; white-space: nowrap; }
+.kpis .bad b { color: var(--stop); }
+.kpis small { display: block; color: var(--faint); font-size: 12px; margin-top: 2px; }
+.spark { display: block; width: 100%; height: 26px; margin-top: 8px; overflow: visible; }
+.spark path { fill: none; stroke: var(--brand); stroke-width: 1.5; stroke-linejoin: round; stroke-linecap: round; }
+.spark .area { fill: color-mix(in srgb, var(--brand) 10%, transparent); stroke: none; }
+.meter { height: 5px; border-radius: 3px; background: var(--rule2); margin-top: 10px; overflow: hidden; }
+.meter i { display: block; height: 100%; background: var(--brand); border-radius: 3px; }
 .meter.full i { background: var(--stop); }
-.numbers small { display: block; color: var(--faint); font-size: 12px; margin-top: 4px; }
 
-.traffic { background: var(--panel); border: 1px solid var(--rule); border-radius: 14px; padding: 22px 26px 18px; margin: 0 0 64px; }
-.traffic header { display: flex; justify-content: space-between; align-items: baseline; gap: 12px 24px; flex-wrap: wrap; margin-bottom: 18px; }
-.traffic h2 { font-size: 18px; margin: 0; }
-.traffic header p { margin: 0; color: var(--soft); font-size: 14px; }
-.keys { display: flex; flex-wrap: wrap; gap: 4px 18px; list-style: none; margin: 0; padding: 0; font-size: 13px; color: var(--soft); }
-.keys i { display: inline-block; width: 10px; height: 10px; border-radius: 3px; margin-right: 6px; vertical-align: -1px; }
+.grid2 { display: grid; grid-template-columns: minmax(0, 2fr) minmax(0, 1fr); gap: 20px; margin-top: 20px; }
+.traffic { display: flex; flex-direction: column; }
+.traffic .body { padding: 14px 22px 16px; flex: 1; display: flex; flex-direction: column; }
+.keys { display: flex; flex-wrap: wrap; gap: 4px 16px; list-style: none; margin: 0; padding: 0; font-size: 12px; color: var(--soft); }
+.keys i { display: inline-block; width: 9px; height: 9px; border-radius: 2px; margin-right: 6px; vertical-align: 0; }
 .k-ok i { background: var(--s-ok); } .k-rerouted i { background: var(--s-rerouted); } .k-failed i { background: var(--s-failed); }
-.plot { position: relative; height: 150px; margin-left: 34px; border-bottom: 1px solid var(--soft); }
+.plot { position: relative; flex: 1; min-height: 170px; margin-left: 30px; border-bottom: 1px solid var(--faint); }
 .grid-y { position: absolute; left: 0; right: 0; border-top: 1px dashed var(--rule); }
-.grid-y span { position: absolute; right: calc(100% + 8px); top: -9px; font-size: 12px; color: var(--faint); font-variant-numeric: tabular-nums; }
+.grid-y span { position: absolute; right: calc(100% + 8px); top: -9px; font-size: 11px; color: var(--faint); font-variant-numeric: tabular-nums; }
 .bars { position: absolute; inset: 0; display: flex; align-items: flex-end; gap: 2px; }
-.bar { flex: 1 1 0; height: 100%; display: flex; flex-direction: column-reverse; gap: 2px; position: relative; }
-.bar i { display: block; min-height: 2px; }
-.bar i:last-child { border-radius: 3px 3px 0 0; }
-.bar .ok { background: var(--s-ok); } .bar .rerouted { background: var(--s-rerouted); } .bar .failed { background: var(--s-failed); }
-.bar:hover, .bar:focus-visible { background: color-mix(in srgb, var(--ink) 6%, transparent); outline: 0; }
-.axis-x { display: flex; justify-content: space-between; margin: 6px 0 0 34px; font-size: 12px; color: var(--faint); }
-.tip { position: absolute; bottom: calc(100% + 8px); background: var(--ink); color: var(--paper); font-size: 13px; line-height: 1.45; padding: 8px 11px;
-  border-radius: 8px; white-space: nowrap; pointer-events: none; z-index: 3; transform: translateX(-50%); }
+.col { flex: 1 1 0; height: 100%; display: flex; flex-direction: column-reverse; gap: 2px; position: relative; }
+.col i { display: block; min-height: 2px; }
+.col i:last-child { border-radius: 2px 2px 0 0; }
+.col .ok { background: var(--s-ok); } .col .rerouted { background: var(--s-rerouted); } .col .failed { background: var(--s-failed); }
+.col:hover, .col:focus-visible { background: color-mix(in srgb, var(--ink) 6%, transparent); outline: 0; }
+.axis-x { display: flex; justify-content: space-between; margin: 6px 0 0 30px; font-size: 11px; color: var(--faint); }
+.tip { position: absolute; bottom: calc(100% + 8px); background: var(--ink); color: var(--panel); font-size: 12px; line-height: 1.5; padding: 8px 11px;
+  border-radius: 7px; white-space: nowrap; pointer-events: none; z-index: 3; transform: translateX(-50%); font-variant-numeric: tabular-nums; }
 .tip b { display: block; }
 .tip i { display: inline-block; width: 8px; height: 8px; border-radius: 2px; margin-right: 6px; }
-.section-head { display: flex; align-items: end; justify-content: space-between; gap: 16px; flex-wrap: wrap; margin-bottom: 20px; }
-h2 { font-size: 24px; letter-spacing: -.02em; margin: 0 0 4px; }
-.lead { color: var(--soft); margin: 0; max-width: 62ch; }
-.legend { display: flex; flex-wrap: wrap; gap: 6px 18px; color: var(--soft); font-size: 13px; padding: 0; margin: 0; list-style: none; }
+
+.journal { display: flex; flex-direction: column; min-height: 0; }
+.journal ol { list-style: none; margin: 12px 0 0; padding: 0 8px 10px 22px; overflow-y: auto; max-height: 262px; flex: 1; }
+.journal li { display: grid; grid-template-columns: 58px 1fr; gap: 10px; padding: 8px 12px 8px 0; border-top: 1px solid var(--rule2); font-size: 13px; line-height: 1.4; }
+.journal li:first-child { border-top: 0; }
+.journal time { color: var(--faint); font-variant-numeric: tabular-nums; }
+.journal .ev { padding-left: 14px; position: relative; overflow-wrap: anywhere; }
+.journal .ev::before { content: ""; position: absolute; left: 0; top: .45em; width: 7px; height: 7px; border-radius: 50%; background: var(--idle); }
+.journal .good::before { background: var(--go); } .journal .warn::before { background: var(--wait); } .journal .bad::before { background: var(--stop); }
+.journal .ev code { font-family: var(--mono); font-size: 12px; }
+.journal .empty { color: var(--faint); font-size: 13px; padding: 12px 22px 18px 0; border: 0; display: block; }
+
+.legend { display: flex; flex-wrap: wrap; gap: 6px 18px; color: var(--soft); font-size: 13px; padding: 0; margin: 0 0 14px; list-style: none; }
 .legend i { display: inline-block; width: 11px; height: 11px; border-radius: 50%; border: 3px solid var(--idle); background: var(--panel); margin-right: 6px; vertical-align: -1px; }
 .legend .go i { border-color: var(--go); } .legend .wait i { border-color: var(--wait); } .legend .stopped i { border-color: var(--stop); background: var(--stop); }
-
-.line { --c: #2455d8; background: var(--panel); border: 1px solid var(--rule); border-radius: 14px; padding: 20px 26px 22px; margin-bottom: 12px; }
+.lines { display: grid; gap: 12px; }
+.line { --c: #2455d8; padding: 16px 22px 18px; }
 .line.blocked { border-color: var(--stop); }
-.line header { display: flex; align-items: center; gap: 14px; flex-wrap: wrap; margin-bottom: 20px; }
-.badge { background: var(--c); color: #fff; font-weight: 700; font-size: 15px; letter-spacing: .01em; padding: 4px 12px; border-radius: 8px; }
-.line header .info { color: var(--soft); font-size: 14px; }
+.line header { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; margin-bottom: 16px; font-size: 13px; }
+.badge { background: var(--c); color: #fff; font-weight: 700; font-size: 13px; padding: 3px 10px; border-radius: 6px; }
+.line header .info { color: var(--soft); }
 .line header .info b { color: var(--ink); font-weight: 600; }
-.line header .count { margin-left: auto; color: var(--soft); font-size: 14px; font-variant-numeric: tabular-nums; }
+.line header .count { margin-left: auto; color: var(--soft); font-variant-numeric: tabular-nums; }
 .stops { list-style: none; margin: 0; padding: 0; display: flex; position: relative; }
-.stop { position: relative; flex: 1 1 0; min-width: 0; padding: 36px 12px 0 0; }
-.stop::before { content: ""; position: absolute; top: 13px; left: 0; right: 0; height: 6px; background: var(--c); }
-.stop:first-child::before { left: 13px; }
-.stop:last-child::before { right: calc(100% - 13px); }
+.stop { position: relative; flex: 1 1 0; min-width: 0; padding: 32px 12px 0 0; }
+.stop::before { content: ""; position: absolute; top: 11px; left: 0; right: 0; height: 5px; background: var(--c); }
+.stop:first-child::before { left: 11px; }
+.stop:last-child::before { right: calc(100% - 11px); }
 .stop:only-child::before { display: none; }
-.dot { position: absolute; top: 3px; left: 3px; width: 26px; height: 26px; border-radius: 50%; background: var(--panel); border: 6px solid var(--idle); z-index: 1; }
+.dot { position: absolute; top: 2px; left: 2px; width: 23px; height: 23px; border-radius: 50%; background: var(--panel); border: 5px solid var(--idle); z-index: 1; }
 .go .dot { border-color: var(--go); } .wait .dot { border-color: var(--wait); } .stopped .dot { border-color: var(--stop); background: var(--stop); }
 .head .dot { border-color: var(--go); background: var(--go); }
 .arrive .dot { animation: arrive .7s ease-out; }
-@keyframes arrive { from { box-shadow: 0 0 0 0 color-mix(in srgb, var(--go) 60%, transparent); } to { box-shadow: 0 0 0 14px transparent; } }
-.who { display: block; font-size: 12px; color: var(--faint); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.what { display: block; font-weight: 600; font-size: 15px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.how { display: block; font-size: 13px; margin-top: 2px; color: var(--faint); font-variant-numeric: tabular-nums; }
+@keyframes arrive { from { box-shadow: 0 0 0 0 color-mix(in srgb, var(--go) 60%, transparent); } to { box-shadow: 0 0 0 12px transparent; } }
+.who { display: block; font-size: 11px; color: var(--faint); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.what { display: block; font-weight: 600; font-size: 14px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.how { display: block; font-size: 12px; margin-top: 1px; color: var(--faint); font-variant-numeric: tabular-nums; }
 .go .how { color: var(--go); } .wait .how { color: var(--wait); } .stopped .how { color: var(--stop); }
-.train { position: absolute; top: 9px; left: 3px; width: 26px; height: 14px; border-radius: 7px; background: var(--c); border: 2px solid var(--panel);
+.train { position: absolute; top: 7px; left: 2px; width: 24px; height: 13px; border-radius: 7px; background: var(--c); border: 2px solid var(--panel);
   z-index: 2; pointer-events: none; }
 
-.connect { margin-top: 48px; display: grid; grid-template-columns: 1fr auto; gap: 18px 24px; align-items: center; background: var(--ink); color: var(--paper);
-  border-radius: 14px; padding: 24px 26px; }
-.connect h3 { margin: 0 0 4px; font-size: 18px; }
-.connect p { margin: 0; color: color-mix(in srgb, var(--paper) 72%, transparent); font-size: 15px; }
-.connect .code { background: transparent; color: var(--paper); border-color: color-mix(in srgb, var(--paper) 30%, transparent); }
-.connect button { background: var(--paper); color: var(--ink); border: 0; border-radius: 9px; padding: 11px 18px; font-weight: 700; }
-
-details { margin-top: 40px; border-top: 1px solid var(--rule); padding-top: 18px; }
-summary { cursor: pointer; font-weight: 700; font-size: 16px; width: fit-content; }
-.tablewrap { overflow-x: auto; margin-top: 14px; }
-table { width: 100%; border-collapse: collapse; font-size: 14px; font-variant-numeric: tabular-nums; }
-th, td { text-align: left; padding: 9px 16px 9px 0; border-bottom: 1px solid var(--rule); white-space: nowrap; }
-th { color: var(--soft); font-weight: 600; }
-td:first-child { font-family: var(--mono); font-size: 13px; }
+.tablewrap { overflow-x: auto; }
+table { width: 100%; border-collapse: collapse; font-size: 13px; font-variant-numeric: tabular-nums; }
+th, td { text-align: left; padding: 10px 14px; border-bottom: 1px solid var(--rule2); white-space: nowrap; }
+th { color: var(--soft); font-weight: 600; font-size: 12px; background: var(--sunk); border-bottom-color: var(--rule); }
+th:first-child, td:first-child { padding-left: 22px; }
+th:last-child, td:last-child { padding-right: 22px; }
+tr:last-child td { border-bottom: 0; }
+td.id { font-family: var(--mono); font-size: 12.5px; }
+td.id small { color: var(--faint); font-family: var(--sans); margin-left: 6px; }
 .num { text-align: right; }
+.pill { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; font-weight: 600; padding: 2px 9px 2px 8px; border-radius: 999px;
+  background: color-mix(in srgb, var(--idle) 18%, transparent); color: var(--soft); }
+.pill::before { content: ""; width: 6px; height: 6px; border-radius: 50%; background: var(--idle); }
+.pill.go { background: color-mix(in srgb, var(--go) 12%, transparent); color: var(--go); } .pill.go::before { background: var(--go); }
+.pill.wait { background: color-mix(in srgb, var(--wait) 14%, transparent); color: var(--wait); } .pill.wait::before { background: var(--wait); }
+.pill.stopped { background: color-mix(in srgb, var(--stop) 12%, transparent); color: var(--stop); } .pill.stopped::before { background: var(--stop); }
+.muted { color: var(--faint); }
 
-.gate { max-width: 540px; }
-.gate h1 { font-size: clamp(30px, 5vw, 46px); line-height: 1.08; letter-spacing: -.03em; margin: 0 0 12px; }
-.gate p { color: var(--soft); margin: 0; }
-.gate form { display: flex; gap: 10px; flex-wrap: wrap; margin-top: 26px; }
-.gate input { flex: 1 1 240px; font: inherit; padding: 12px 14px; border-radius: 10px; border: 1px solid var(--rule); background: var(--panel); color: var(--ink); }
-.gate button { font-weight: 700; padding: 12px 22px; border: 0; border-radius: 10px; background: var(--ink); color: var(--paper); }
-.gate .msg { color: var(--stop); width: 100%; margin: 0; min-height: 1.5em; }
+.connect { margin-top: 20px; }
+.connect .body { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1.4fr); gap: 22px; padding: 16px 22px 22px; }
+.fields { display: grid; gap: 12px; align-content: start; margin: 0; }
+.fields dt { color: var(--soft); font-size: 12px; margin-bottom: 4px; }
+.fields dd { margin: 0; display: flex; gap: 8px; align-items: center; }
+.fields .val { flex: 1; min-width: 0; font-family: var(--mono); font-size: 13px; background: var(--sunk); border: 1px solid var(--rule); border-radius: 7px; padding: 8px 10px;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.btn { background: var(--panel); color: var(--ink); border: 1px solid var(--rule); border-radius: 7px; padding: 7px 12px; font-size: 13px; font-weight: 600; white-space: nowrap; }
+.btn:hover { background: var(--sunk); }
+.snippet { border: 1px solid var(--rule); border-radius: 9px; overflow: hidden; min-width: 0; }
+.tabs { display: flex; align-items: center; gap: 2px; background: var(--sunk); border-bottom: 1px solid var(--rule); padding: 4px 6px; }
+.tabs [role=tab] { background: none; border: 0; color: var(--soft); font-size: 13px; padding: 5px 10px; border-radius: 6px; }
+.tabs [role=tab][aria-selected=true] { background: var(--panel); color: var(--ink); font-weight: 600; box-shadow: 0 0 0 1px var(--rule); }
+.tabs .btn { margin-left: auto; padding: 4px 10px; }
+pre { margin: 0; padding: 14px 16px; font: 12.5px/1.6 var(--mono); overflow-x: auto; background: var(--panel); }
 
-@media (max-width: 700px) {
-  main { padding: 0 16px 48px; }
-  .top { margin-bottom: 36px; }
-  .hero { column-gap: 14px; }
-  .signal { width: 16px; height: 16px; }
-  .numbers { grid-template-columns: 1fr 1fr; }
-  .numbers > div + div { border-left: 0; }
-  .numbers > div:nth-child(even) { border-left: 1px solid var(--rule); }
-  .numbers > div:nth-child(n+3) { border-top: 1px solid var(--rule); }
-  .line { padding: 18px 18px 8px; }
-  .traffic { padding: 18px 16px 14px; }
+footer { border-top: 1px solid var(--rule); color: var(--faint); font-size: 12px; }
+footer .wrap { display: flex; gap: 16px; flex-wrap: wrap; padding-top: 18px; padding-bottom: 28px; }
+
+.gate { max-width: 480px; margin: 12vh auto 0; padding: 28px; }
+.gate h1 { font-size: 22px; letter-spacing: -.02em; margin: 0 0 8px; }
+.gate p { color: var(--soft); margin: 0; font-size: 14px; }
+.gate form { display: flex; gap: 10px; flex-wrap: wrap; margin-top: 20px; }
+.gate input { flex: 1 1 220px; font: inherit; padding: 10px 12px; border-radius: 8px; border: 1px solid var(--rule); background: var(--sunk); color: var(--ink); }
+.gate button { font-weight: 700; padding: 10px 18px; border: 0; border-radius: 8px; background: var(--ink); color: var(--panel); }
+.gate .msg { color: var(--stop); width: 100%; margin: 0; min-height: 1.4em; font-size: 13px; }
+
+@media (max-width: 1040px) {
+  .kpis { grid-template-columns: repeat(3, 1fr); }
+  .kpis > div:nth-child(4) { border-left: 0; }
+  .kpis > div:nth-child(n+4) { border-top: 1px solid var(--rule2); }
+  .grid2, .connect .body { grid-template-columns: 1fr; }
+  nav { display: none; }
+}
+@media (max-width: 640px) {
+  .wrap { padding: 0 14px; }
+  .meta .extra { display: none; }
+  .status { grid-template-columns: auto 1fr; }
+  .status .since { grid-column: 2; grid-row: auto; text-align: left; }
+  .kpis { grid-template-columns: 1fr 1fr; }
+  .kpis > div:nth-child(n) { border-left: 0; border-top: 1px solid var(--rule2); }
+  .kpis > div:nth-child(-n+2) { border-top: 0; }
+  .kpis > div:nth-child(even) { border-left: 1px solid var(--rule2); }
+  .kpis b { font-size: 22px; }
   .bars { gap: 1px; }
+  .line { padding: 14px 16px 6px; }
   .line header .count { margin-left: 0; width: 100%; }
   .stops { flex-direction: column; }
-  .stop { flex: none; padding: 0 0 18px 44px; min-height: 48px; }
-  .stop::before { top: 0; bottom: 0; left: 13px; right: auto; width: 6px; height: auto; }
-  .stop:first-child::before { top: 13px; left: 13px; }
-  .stop:last-child::before { right: auto; bottom: calc(100% - 16px); }
-  .train { top: 3px; left: 9px; width: 14px; height: 26px; }
-  .connect { grid-template-columns: 1fr; }
+  .stop { flex: none; padding: 0 0 16px 40px; min-height: 44px; }
+  .stop::before { top: 0; bottom: 0; left: 11px; right: auto; width: 5px; height: auto; }
+  .stop:first-child::before { top: 11px; left: 11px; }
+  .stop:last-child::before { right: auto; bottom: calc(100% - 14px); }
+  .train { top: 2px; left: 7px; width: 13px; height: 24px; }
 }
 @media (prefers-reduced-motion: reduce) { .train { display: none; } .arrive .dot { animation: none; } }
 [hidden] { display: none !important; }
@@ -1491,51 +1559,67 @@ td:first-child { font-family: var(--mono); font-size: 13px; }
 const DASHBOARD_JS = `
 const T = {
   en: {
-    live: 'Live', offline: 'Not answering', up: 'up ',
+    nav: ['Overview', 'Lines', 'Models', 'Connect'], live: 'Live', offline: 'Not answering', updated: 'updated ', since: 'Up for ',
     good: 'Good service on all lines.', delays: 'Minor delays.', idleTitle: 'Ready for the first request.',
     suspended: (n) => 'Service suspended on ' + n + '.', down: 'Bascule is not answering.',
-    idleText: 'Nothing has gone through yet. Connect an application with the address below and the lines will light up.',
+    idleText: 'Nothing has gone through yet. Connect an application with the details below and the lines will light up.',
     summary: (up, ok, fb) => 'In the last ' + up + ', <strong>' + ok + (ok === '1' ? ' request' : ' requests') + ' answered</strong>' + (fb !== '0' ? ', of which <strong>' + fb + '</strong> reached their answer by switching model.' : '.'),
     detourText: (n) => ' ' + n + (n > 1 ? ' stations are' : ' station is') + ' paused, so requests are rerouted to the next open one.',
     blockedText: ' Every station on this line is paused or down, so its requests fail until one reopens.',
     downText: 'Start it again with the command <span class="code">bascule</span>. This page reconnects on its own.',
-    availability: 'Availability', answered: 'Requests answered', switched: 'Rerouted', failed: 'Failed', speed: 'Average response time', tokens: 'Tokens processed', cached: 'Answered from cache',
-    spent: 'Spent today', of: (b) => 'Budget ' + b + ' a day', free: 'Free models only', capTitle: 'Daily budget reached.',
-    capText: (b) => 'Today’s spend has reached ' + b + '. Until midnight, requests go to free models only; paid stations are closed.', capped: 'Closed: budget reached', cost: 'Cost today',
-    trafficTitle: 'Traffic, last hour', trafficLead: 'Requests per minute.', ago: (m) => m + ' min ago', nowLabel: 'now',
-    sOk: 'Answered directly', sRerouted: 'Answered after reroute', sFailed: 'Failed', tipMin: (t) => t, avgMs: (ms) => ms + ' ms on average',
-    linesTitle: 'Lines', linesLead: 'A request stops at the first open station. If it is busy or down, the request continues to the next one.',
+    availability: 'Availability', answered: 'Requests answered', switched: 'Rerouted', failed: 'Failed', speed: 'Avg. response time', spent: 'Spent today', cached: 'From cache',
+    of: (b) => 'Budget ' + b + ' a day', perMinLast: 'last 60 min',
+    capTitle: 'Daily budget reached.', capText: (b) => 'Today’s spend has reached ' + b + '. Until midnight, requests go to free models only; paid stations are closed.', capped: 'Closed: budget reached',
+    trafficTitle: 'Traffic', trafficLead: 'Requests per minute, last hour.', ago: (m) => m + ' min ago', nowLabel: 'now',
+    sOk: 'Answered directly', sRerouted: 'Answered after reroute', sFailed: 'Failed', avgMs: (ms) => ms + ' ms average',
+    journalTitle: 'Activity', journalLead: 'Pauses, recoveries and changes.', journalEmpty: 'Nothing to report yet.',
+    evPause: (t, why, d) => '<code>' + t + '</code> paused for ' + d + ' (' + why + ')', evBack: (t) => '<code>' + t + '</code> is open again',
+    evLearned: (t, c) => '<code>' + t + '</code> cannot handle ' + c + ': such requests now skip it', evReload: 'Configuration reloaded',
+    evReloadFailed: (m) => 'New configuration rejected, previous one kept: ' + m, evBudget: (b) => 'Daily budget of ' + b + ' reached: free models only until midnight',
+    why: { 429: 'rate limit', 401: 'key refused', 403: 'key refused', 402: 'no credit left', 0: 'unreachable', 5: 'provider error' },
+    linesTitle: 'Lines', linesLead: 'Each combo is a line. A request stops at the first open station; if that one is paused or down, it continues to the next.',
     now: 'Now serving', blockedLine: 'No open station', served: (n) => n + ' answered',
-    go: 'Open', wait: (s) => 'Back in ' + s, stopped: 'Down', idle: 'Not used yet',
+    go: 'Open', ready: 'Available', wait: (s) => 'Back in ' + s, stopped: 'Down', idle: 'Not used yet',
     lgo: 'Open', lwait: 'Paused, reopens on its own', lstopped: 'Down, check the key', lidle: 'Not used yet',
-    connectTitle: 'Connect an application', connectText: (u) => 'Use <span class="code">' + u + '</span> as the OpenAI-compatible address, your access key as the API key, and <span class="code">auto</span> as the model.',
-    copy: 'Copy address', copied: 'Address copied',
-    details: 'Technical details', model: 'Model and key', state: 'State', ok: 'Answered', err: 'Errors', latency: 'Response time', limit: 'Limit', cannot: 'Cannot handle',
-    perMin: '/min', vision: 'images', tools: 'tools',
-    gateTitle: 'This dashboard is locked.', gateText: 'Paste your access key: the BASCULE_KEY line in ~/.bascule/.env. The command bascule dashboard opens it already unlocked.',
+    modelsTitle: 'Models', modelsLead: 'Every model and key Bascule has used since it started.',
+    model: 'Model', key: 'key', state: 'Status', ok: 'Answered', err: 'Errors', latency: 'Response time', cost: 'Cost today', limit: 'Limit', cannot: 'Cannot handle',
+    perMin: '/min', vision: 'images', tools: 'tools', none: 'No model has been used yet.',
+    connectTitle: 'Connect an application', connectLead: 'Bascule speaks the OpenAI and Anthropic APIs. Point any compatible client at it.',
+    baseUrl: 'Base URL', apiKey: 'API key', apiKeyVal: 'Your BASCULE_KEY (in ~/.bascule/.env)', modelName: 'Model', modelVal: 'auto, fast, smart or local',
+    copy: 'Copy', copied: 'Copied',
+    footer: (v) => ['bascule ' + v, 'OpenAI-compatible AI router', 'MIT licence'],
+    gateTitle: 'This dashboard is locked.', gateText: 'Enter your access key: the BASCULE_KEY line in ~/.bascule/.env. The command bascule dashboard opens it already unlocked.',
     open: 'Unlock', badKey: 'This key does not match BASCULE_KEY.', placeholder: 'Access key' },
   fr: {
-    live: 'En direct', offline: 'Ne répond pas', up: 'actif depuis ',
+    nav: ['Vue d’ensemble', 'Lignes', 'Modèles', 'Connexion'], live: 'En direct', offline: 'Ne répond pas', updated: 'mis à jour à ', since: 'Actif depuis ',
     good: 'Trafic normal sur toutes les lignes.', delays: 'Trafic perturbé.', idleTitle: 'Prêt pour la première demande.',
     suspended: (n) => 'Trafic interrompu sur ' + n + '.', down: 'Bascule ne répond pas.',
-    idleText: 'Aucune demande pour l’instant. Branchez une application avec l’adresse ci-dessous et les lignes s’allumeront.',
+    idleText: 'Aucune demande pour l’instant. Branchez une application avec les informations ci-dessous et les lignes s’allumeront.',
     summary: (up, ok, fb) => 'Depuis ' + up + ', <strong>' + ok + (ok === '1' ? ' demande servie' : ' demandes servies') + '</strong>' + (fb !== '0' ? ', dont <strong>' + fb + '</strong> arrivées à destination grâce à un changement de modèle.' : '.'),
     detourText: (n) => ' ' + n + (n > 1 ? ' stations sont en pause' : ' station est en pause') + ' : les demandes sont déviées vers la suivante ouverte.',
     blockedText: ' Toutes les stations de cette ligne sont en pause ou en panne : ses demandes échouent jusqu’à la réouverture de l’une d’elles.',
     downText: 'Relancez-le avec la commande <span class="code">bascule</span>. Cette page se reconnecte d’elle-même.',
-    availability: 'Disponibilité', answered: 'Demandes servies', switched: 'Déviées', failed: 'Échecs', speed: 'Temps de réponse moyen', tokens: 'Tokens traités', cached: 'Servies depuis le cache',
-    spent: 'Dépensé aujourd’hui', of: (b) => 'Budget ' + b + ' par jour', free: 'Modèles gratuits uniquement', capTitle: 'Budget du jour atteint.',
-    capText: (b) => 'La dépense du jour a atteint ' + b + '. Jusqu’à minuit, les demandes vont uniquement vers les modèles gratuits ; les stations payantes sont fermées.', capped: 'Fermée : budget atteint', cost: 'Coût du jour',
-    trafficTitle: 'Trafic de la dernière heure', trafficLead: 'Demandes par minute.', ago: (m) => 'il y a ' + m + ' min', nowLabel: 'maintenant',
-    sOk: 'Servies directement', sRerouted: 'Servies après déviation', sFailed: 'Échouées', tipMin: (t) => t, avgMs: (ms) => ms + ' ms en moyenne',
-    linesTitle: 'Lignes', linesLead: 'Une demande s’arrête à la première station ouverte. Si elle est occupée ou en panne, la demande continue vers la suivante.',
+    availability: 'Disponibilité', answered: 'Demandes servies', switched: 'Déviées', failed: 'Échecs', speed: 'Temps de réponse moyen', spent: 'Dépensé aujourd’hui', cached: 'Depuis le cache',
+    of: (b) => 'Budget ' + b + ' par jour', perMinLast: '60 dernières min',
+    capTitle: 'Budget du jour atteint.', capText: (b) => 'La dépense du jour a atteint ' + b + '. Jusqu’à minuit, les demandes vont uniquement vers les modèles gratuits ; les stations payantes sont fermées.', capped: 'Fermée : budget atteint',
+    trafficTitle: 'Trafic', trafficLead: 'Demandes par minute, dernière heure.', ago: (m) => 'il y a ' + m + ' min', nowLabel: 'maintenant',
+    sOk: 'Servies directement', sRerouted: 'Servies après déviation', sFailed: 'Échouées', avgMs: (ms) => ms + ' ms en moyenne',
+    journalTitle: 'Activité', journalLead: 'Pauses, reprises et changements.', journalEmpty: 'Rien à signaler pour l’instant.',
+    evPause: (t, why, d) => '<code>' + t + '</code> en pause pour ' + d + ' (' + why + ')', evBack: (t) => '<code>' + t + '</code> de nouveau ouvert',
+    evLearned: (t, c) => '<code>' + t + '</code> ne gère pas les ' + c + ' : ces demandes l’évitent désormais', evReload: 'Configuration rechargée',
+    evReloadFailed: (m) => 'Nouvelle configuration refusée, l’ancienne reste active : ' + m, evBudget: (b) => 'Budget du jour de ' + b + ' atteint : modèles gratuits uniquement jusqu’à minuit',
+    why: { 429: 'limite atteinte', 401: 'clé refusée', 403: 'clé refusée', 402: 'crédit épuisé', 0: 'injoignable', 5: 'erreur du fournisseur' },
+    linesTitle: 'Lignes', linesLead: 'Chaque combo est une ligne. Une demande s’arrête à la première station ouverte ; si elle est en pause ou en panne, la demande continue vers la suivante.',
     now: 'Dessert', blockedLine: 'Aucune station ouverte', served: (n) => n + (n === '1' ? ' servie' : ' servies'),
-    go: 'Ouverte', wait: (s) => 'Retour dans ' + s, stopped: 'En panne', idle: 'Pas encore utilisée',
+    go: 'Ouverte', ready: 'Disponible', wait: (s) => 'Retour dans ' + s, stopped: 'En panne', idle: 'Pas encore utilisée',
     lgo: 'Ouverte', lwait: 'En pause, rouvre d’elle-même', lstopped: 'En panne, vérifier la clé', lidle: 'Pas encore utilisée',
-    connectTitle: 'Brancher une application', connectText: (u) => 'Adresse compatible OpenAI <span class="code">' + u + '</span>, votre clé d’accès comme clé API, et le modèle <span class="code">auto</span>.',
-    copy: 'Copier l’adresse', copied: 'Adresse copiée',
-    details: 'Détails techniques', model: 'Modèle et clé', state: 'État', ok: 'Servies', err: 'Erreurs', latency: 'Temps de réponse', limit: 'Limite', cannot: 'Ne gère pas',
-    perMin: '/min', vision: 'images', tools: 'outils',
+    modelsTitle: 'Modèles', modelsLead: 'Chaque modèle et chaque clé utilisés par Bascule depuis son démarrage.',
+    model: 'Modèle', key: 'clé', state: 'État', ok: 'Servies', err: 'Erreurs', latency: 'Temps de réponse', cost: 'Coût du jour', limit: 'Limite', cannot: 'Ne gère pas',
+    perMin: '/min', vision: 'images', tools: 'outils', none: 'Aucun modèle utilisé pour l’instant.',
+    connectTitle: 'Brancher une application', connectLead: 'Bascule parle les API OpenAI et Anthropic. Tout client compatible peut s’y connecter.',
+    baseUrl: 'URL de base', apiKey: 'Clé API', apiKeyVal: 'Votre BASCULE_KEY (dans ~/.bascule/.env)', modelName: 'Modèle', modelVal: 'auto, fast, smart ou local',
+    copy: 'Copier', copied: 'Copié',
+    footer: (v) => ['bascule ' + v, 'Routeur IA compatible OpenAI', 'Licence MIT'],
     gateTitle: 'Ce tableau de bord est verrouillé.', gateText: 'Saisissez votre clé d’accès : la ligne BASCULE_KEY du fichier ~/.bascule/.env. La commande bascule dashboard l’ouvre directement déverrouillé.',
     open: 'Déverrouiller', badKey: 'Cette clé ne correspond pas à BASCULE_KEY.', placeholder: 'Clé d’accès' },
 };
@@ -1548,10 +1632,12 @@ const esc = (s) => String(s).replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&l
 const fmt = (n) => Math.round(Number(n || 0)).toLocaleString(lang);
 const dur = (s) => s >= 86400 ? Math.floor(s / 86400) + (lang === 'fr' ? ' j ' : ' d ') + Math.floor(s % 86400 / 3600) + ' h'
   : s >= 3600 ? Math.floor(s / 3600) + ' h ' + Math.floor(s % 3600 / 60) + ' min' : s >= 60 ? Math.floor(s / 60) + ' min' : s + ' s';
-const endpoint = location.origin + '/v1';
+const clock = (t, sec) => new Date(t).toLocaleTimeString(lang, { hour: '2-digit', minute: '2-digit', ...(sec && { second: '2-digit' }) });
 const usd = (v) => new Intl.NumberFormat(lang, { style: 'currency', currency: 'USD', currencyDisplay: 'narrowSymbol', minimumFractionDigits: 2, maximumFractionDigits: v > 0 && v < 0.01 ? 4 : 2 }).format(v);
+const endpoint = location.origin + '/v1';
 const still = matchMedia('(prefers-reduced-motion: reduce)');
 const LINE_COLORS = ['#2455d8', '#7a3fc4', '#0b7f8a', '#b8406f', '#8a5a1f', '#3b5b86'];
+const SVG = 'http://www.w3.org/2000/svg';
 
 let key = localStorage.getItem('bascule-key') || '';
 function keyFromHash() {
@@ -1561,39 +1647,65 @@ function keyFromHash() {
 keyFromHash();
 addEventListener('hashchange', () => { keyFromHash(); poll(); });
 
-$('gate-title').textContent = L.gateTitle; $('gate-text').textContent = L.gateText; $('open').textContent = L.open;
+// Static text, set once.
+const text = { 'gate-title': L.gateTitle, 'gate-text': L.gateText, open: L.open, 'traffic-title': L.trafficTitle, 'traffic-lead': L.trafficLead,
+  'journal-title': L.journalTitle, 'journal-lead': L.journalLead, 'lines-title': L.linesTitle, 'lines-lead': L.linesLead,
+  'models-title': L.modelsTitle, 'models-lead': L.modelsLead, 'connect-title': L.connectTitle, 'connect-lead': L.connectLead,
+  'f-base': L.baseUrl, 'f-key': L.apiKey, 'f-key-val': L.apiKeyVal, 'f-model': L.modelName, 'f-model-val': L.modelVal,
+  x0: L.ago(60), x1: L.ago(30), x2: L.nowLabel };
+for (const [id, v] of Object.entries(text)) $(id).textContent = v;
+document.querySelectorAll('nav a').forEach((a, i) => { a.textContent = L.nav[i]; });
+document.querySelectorAll('[data-copy]').forEach((b) => { b.textContent = L.copy; });
+$('f-base-val').textContent = endpoint;
 $('keyinput').placeholder = L.placeholder;
 $('keyform').addEventListener('submit', (e) => { e.preventDefault(); key = $('keyinput').value.trim(); localStorage.setItem('bascule-key', key); $('keyinput').value = ''; poll(); });
-$('lines-title').textContent = L.linesTitle; $('lines-lead').textContent = L.linesLead; $('details-title').textContent = L.details;
 $('legend').replaceChildren(...[['go', L.lgo], ['wait', L.lwait], ['stopped', L.lstopped], ['idle', L.lidle]].map(([c, t]) => el('li', c, el('i'), t)));
-$('connect-title').textContent = L.connectTitle; $('connect-text').innerHTML = L.connectText(esc(endpoint)); $('copy').textContent = L.copy;
-$('copy').addEventListener('click', async () => {
-  try { await navigator.clipboard.writeText(endpoint); $('copy').textContent = L.copied; setTimeout(() => { $('copy').textContent = L.copy; }, 1800); } catch {}
+
+// Copy buttons and code samples.
+const SNIPPETS = {
+  Python: 'from openai import OpenAI\\n\\nclient = OpenAI(base_url="' + endpoint + '", api_key="<BASCULE_KEY>")\\nreply = client.chat.completions.create(\\n    model="auto",\\n    messages=[{"role": "user", "content": "Hello"}],\\n)\\nprint(reply.choices[0].message.content)',
+  JavaScript: 'import OpenAI from "openai";\\n\\nconst client = new OpenAI({ baseURL: "' + endpoint + '", apiKey: "<BASCULE_KEY>" });\\nconst reply = await client.chat.completions.create({\\n  model: "auto",\\n  messages: [{ role: "user", content: "Hello" }],\\n});\\nconsole.log(reply.choices[0].message.content);',
+  curl: 'curl ' + endpoint + '/chat/completions \\\\\\n  -H "Authorization: Bearer <BASCULE_KEY>" \\\\\\n  -H "Content-Type: application/json" \\\\\\n  -d \\'{"model": "auto", "messages": [{"role": "user", "content": "Hello"}]}\\'',
+};
+const tabs = $('tabs');
+Object.keys(SNIPPETS).forEach((name, i) => {
+  const b = el('button', '', name);
+  b.type = 'button'; b.setAttribute('role', 'tab'); b.setAttribute('aria-selected', String(i === 0)); b.setAttribute('aria-controls', 'code');
+  b.addEventListener('click', () => { for (const t of tabs.querySelectorAll('[role=tab]')) t.setAttribute('aria-selected', String(t === b)); $('code').textContent = SNIPPETS[name]; });
+  tabs.insertBefore(b, $('copy-code'));
 });
+$('code').textContent = SNIPPETS.Python;
+async function copy(btn, value) {
+  try { await navigator.clipboard.writeText(value); btn.textContent = L.copied; setTimeout(() => { btn.textContent = L.copy; }, 1600); } catch {}
+}
+$('copy-base').addEventListener('click', (e) => copy(e.currentTarget, endpoint));
+$('copy-code').addEventListener('click', (e) => copy(e.currentTarget, $('code').textContent));
 
 function stateOf(t) {
   if (!t) return 'idle';
   if (t.coolingForS) return 'wait';
   if (!t.ok && !t.err) return 'idle';
-  return t.ok ? 'go' : 'stopped';
+  // Down only after several failures in a row; a single error that has cooled off is not an outage.
+  if (t.fails >= 3) return 'stopped';
+  return t.ok ? 'go' : 'ready';
 }
 // Several keys per model: the station is open while one key is.
 function station(st, id) {
   if (st.cost?.capped && st.cost.priced.includes(id)) return { s: 'wait', capped: true };
   const ks = Object.entries(st.targets).filter(([hid]) => hid.startsWith(id + '#')).map(([, t]) => t);
   if (!ks.length) return { s: 'idle' };
-  for (const s of ['go', 'idle']) { const t = ks.find((k) => stateOf(k) === s); if (t) return { s, t }; }
+  for (const s of ['go', 'ready', 'idle']) { const t = ks.find((k) => stateOf(k) === s); if (t) return { s, t }; }
   const t = ks.filter((k) => k.coolingForS).sort((a, b) => a.coolingForS - b.coolingForS)[0];
   return t ? { s: 'wait', t } : { s: 'stopped', t: ks[0] };
 }
 const say = (s, t, capped) => capped ? L.capped : s === 'wait' ? L.wait(dur(t.coolingForS)) : L[s];
 const split = (id) => { const i = id.indexOf('/'); return [id.slice(0, i), id.slice(i + 1)]; };
+const baseOf = (hid) => hid.replace(/^[a-z]+:/, '').replace(/#[0-9]+$/, '');
 
-// Numbers glide to their new value instead of jumping.
+// Numbers glide to their new value; the first value is shown as is.
 function count(node, to) {
   const first = node.dataset.v === undefined, from = Number(node.dataset.v || 0);
   node.dataset.v = to;
-  // The first value is shown as is: counting up from zero on load would misreport the totals.
   if (first || still.matches || from === to || !node.isConnected) { node.textContent = fmt(to); return; }
   const t0 = performance.now();
   const step = (now) => {
@@ -1602,6 +1714,19 @@ function count(node, to) {
     if (k < 1 && node.dataset.v == to) requestAnimationFrame(step);
   };
   requestAnimationFrame(step);
+}
+function spark(values) {
+  const svg = document.createElementNS(SVG, 'svg');
+  svg.setAttribute('class', 'spark'); svg.setAttribute('viewBox', '0 0 120 26'); svg.setAttribute('preserveAspectRatio', 'none'); svg.setAttribute('aria-hidden', 'true');
+  const pts = values.map((v, i) => [i * 120 / (values.length - 1), v]);
+  const max = Math.max(1, ...values.filter((v) => v !== null));
+  const xy = pts.filter(([, v]) => v !== null).map(([x, v]) => x.toFixed(1) + ',' + (24 - v / max * 22).toFixed(1));
+  if (xy.length < 2) return svg;
+  const line = document.createElementNS(SVG, 'path'), area = document.createElementNS(SVG, 'path');
+  line.setAttribute('d', 'M' + xy.join('L'));
+  area.setAttribute('class', 'area'); area.setAttribute('d', 'M' + xy[0].split(',')[0] + ',25L' + xy.join('L') + 'L' + xy.at(-1).split(',')[0] + ',25Z');
+  svg.append(area, line);
+  return svg;
 }
 
 // Lines are built once per shape and then updated in place, so running trains are not cut.
@@ -1617,7 +1742,7 @@ function buildLines(st) {
       return { id, li, how };
     });
     const ol = el('ol', 'stops', ...stops.map((x) => x.li));
-    const sec = el('section', 'line', el('header', '', el('span', 'badge', name), info, cnt), ol);
+    const sec = el('section', 'card line', el('header', '', el('span', 'badge', name), info, cnt), ol);
     sec.style.setProperty('--c', LINE_COLORS[i % LINE_COLORS.length]);
     built[name] = { sec, info, cnt, ol, stops };
     return sec;
@@ -1626,7 +1751,7 @@ function buildLines(st) {
 function train(line, stop) {
   stop.li.classList.remove('arrive');
   if (still.matches) return;
-  const box = line.ol.getBoundingClientRect(), a = line.stops[0].li.querySelector('.dot').getBoundingClientRect(), b = stop.li.querySelector('.dot').getBoundingClientRect();
+  const a = line.stops[0].li.querySelector('.dot').getBoundingClientRect(), b = stop.li.querySelector('.dot').getBoundingClientRect();
   const dx = b.left - a.left, dy = b.top - a.top;
   const car = el('span', 'train');
   line.ol.append(car);
@@ -1636,8 +1761,30 @@ function train(line, stop) {
     .finished.then(() => { car.remove(); void stop.li.offsetWidth; stop.li.classList.add('arrive'); }, () => car.remove());
 }
 
+function why(status) { return L.why[status] || (status >= 500 ? L.why[5] : 'HTTP ' + status); }
+function journal(st) {
+  const evs = (st.events || []).slice().reverse();
+  const sig = evs.length + ':' + (evs[0]?.t || 0);
+  if ($('journal').dataset.sig === sig) return;
+  $('journal').dataset.sig = sig;
+  if (!evs.length) { $('journal').replaceChildren(el('li', 'empty', L.journalEmpty)); return; }
+  $('journal').replaceChildren(...evs.map((e) => {
+    const t = e.target ? esc(baseOf(e.target)) : '';
+    const [cls, html] = e.kind === 'pause' ? ['warn', L.evPause(t, why(e.status), dur(Math.round(e.ms / 1000)))]
+      : e.kind === 'back' ? ['good', L.evBack(t)]
+      : e.kind === 'learned' ? ['', L.evLearned(t, L[e.cap] || e.cap)]
+      : e.kind === 'budget' ? ['bad', L.evBudget(usd(e.usd))]
+      : e.kind === 'reloadFailed' ? ['bad', L.evReloadFailed(esc(e.detail))] : ['good', L.evReload];
+    const ev = el('span', 'ev ' + cls);
+    ev.innerHTML = html;
+    const time = el('time', '', clock(e.t, true));
+    time.dateTime = new Date(e.t).toISOString();
+    return el('li', '', time, ev);
+  }));
+}
+
 function render(st) {
-  $('meta').replaceChildren(el('span', 'pulse'), L.live + ' · ' + L.up + dur(st.uptimeS) + ' · v' + st.version);
+  $('meta').replaceChildren(el('span', 'pulse'), L.live, el('span', 'extra', '· ' + L.updated + clock(Date.now(), true)));
   const sig = JSON.stringify(st.combos || {});
   if (sig !== shape) { shape = sig; buildLines(st); }
 
@@ -1646,9 +1793,9 @@ function render(st) {
     let head = null;
     for (const x of line.stops) {
       const { s, t, capped } = station(st, x.id);
-      if (!head && (s === 'go' || s === 'idle')) head = x;
+      if (!head && (s === 'go' || s === 'ready' || s === 'idle')) head = x;
       if (s === 'wait' || s === 'stopped') paused.add(x.id);
-      x.li.classList.remove('go', 'wait', 'stopped', 'idle', 'head');
+      x.li.classList.remove('go', 'ready', 'wait', 'stopped', 'idle', 'head');
       x.li.classList.add(s);
       x.how.textContent = say(s, t, capped);
     }
@@ -1659,7 +1806,6 @@ function render(st) {
     line.info.replaceChildren(...(head ? [L.now + ' ', el('b', '', what), ' · ' + who] : [L.blockedLine]));
     const n = Object.values(st.served?.[name] || {}).reduce((a, b) => a + b, 0);
     line.cnt.textContent = n ? L.served(fmt(n)) : '';
-    // A few trains at most per refresh, spaced out, for the answers since the last one.
     if (lastServed) {
       let delay = 0;
       for (const x of line.stops) {
@@ -1671,87 +1817,98 @@ function render(st) {
   lastServed = JSON.parse(JSON.stringify(st.served || {}));
 
   const answered = st.answered, done = st.answered + st.failures, sum = L.summary(dur(st.uptimeS), fmt(answered), fmt(st.rerouted));
-  let title, text, level;
-  if (st.cost?.capped && !blocked.length) { level = 'warn'; title = L.capTitle; text = L.capText(usd(st.cost.budgetUsd)); }
-  else if (blocked.length) { level = 'bad'; title = L.suspended(blocked.join(', ')); text = (done ? sum : '') + L.blockedText; }
-  else if (!done) { level = 'idle'; title = L.idleTitle; text = L.idleText; }
-  else if (paused.size) { level = 'warn'; title = L.delays; text = sum + L.detourText(paused.size); }
-  else { level = 'ok'; title = L.good; text = sum; }
+  let title, body, level;
+  if (st.cost?.capped && !blocked.length) { level = 'warn'; title = L.capTitle; body = L.capText(usd(st.cost.budgetUsd)); }
+  else if (blocked.length) { level = 'bad'; title = L.suspended(blocked.join(', ')); body = (done ? sum : '') + L.blockedText; }
+  else if (!done) { level = 'idle'; title = L.idleTitle; body = L.idleText; }
+  else if (paused.size) { level = 'warn'; title = L.delays; body = sum + L.detourText(paused.size); }
+  else { level = 'ok'; title = L.good; body = sum; }
   $('signal').className = 'signal ' + level;
-  $('title').textContent = title; $('text').innerHTML = text;
+  $('title').textContent = title; $('text').innerHTML = body;
+  $('since').textContent = L.since + dur(st.uptimeS);
 
-  const tl = st.timeline || [], timed = tl.filter((b) => b.latencyMs !== null);
+  const minutes = series(st.timeline || [], st.now);
+  const timed = minutes.filter((b) => b.latencyMs !== null);
   const w = timed.reduce((a, b) => a + b.ok + b.rerouted, 0);
   const avg = w ? Math.round(timed.reduce((a, b) => a + b.latencyMs * (b.ok + b.rerouted), 0) / w) : null;
-  const nums = [['availability', done ? answered / done * 100 : null, (v) => v === null ? '–' : (v >= 99.95 ? '100' : v.toLocaleString(lang, { maximumFractionDigits: 1 })) + ' %'],
-    ['answered', answered], ['switched', st.rerouted], ['failed', st.failures],
-    ['speed', avg, (v) => v === null ? '–' : v < 1000 ? fmt(v) + ' ms' : (v / 1000).toLocaleString(lang, { maximumFractionDigits: 1 }) + ' s'],
-    ['spent', st.cost?.usd || 0, usd], ...(st.cacheHits ? [['cached', st.cacheHits]] : [])];
-  if ($('numbers').dataset.shape !== nums.map((n) => n[0]).join()) {
-    $('numbers').dataset.shape = nums.map((n) => n[0]).join();
-    $('numbers').replaceChildren(...nums.map(([k]) => { const d = el('div', '', el('b'), el('span', '', L[k])); d.id = 'n-' + k; return d; }));
-  }
+  const pct = (v) => v === null ? '–' : (v >= 99.95 ? '100' : v.toLocaleString(lang, { maximumFractionDigits: 1 })) + ' %';
+  const ms = (v) => v === null ? '–' : v < 1000 ? fmt(v) + ' ms' : (v / 1000).toLocaleString(lang, { maximumFractionDigits: 1 }) + ' s';
+  const nums = [['availability', done ? answered / done * 100 : null, pct], ['answered', answered], ['switched', st.rerouted], ['failed', st.failures],
+    ['speed', avg, ms], ['spent', st.cost?.usd || 0, usd]];
+  if (!$('kpis').children.length) $('kpis').replaceChildren(...nums.map(([k]) => { const d = el('div', '', el('span', '', L[k]), el('b')); d.id = 'n-' + k; return d; }));
   for (const [k, v, f] of nums) {
-    const d = $('n-' + k);
+    const d = $('n-' + k), b = d.querySelector('b');
     d.classList.toggle('bad', (k === 'failed' && v > 0) || (k === 'availability' && v !== null && v < 95));
-    if (f) d.firstChild.textContent = f(v); else count(d.firstChild, Math.round(v));
+    if (f) b.textContent = f(v); else count(b, Math.round(v));
   }
-  const sp = $('n-spent'), b = st.cost?.budgetUsd;
+  const withSpark = (k, values, caption) => {
+    const d = $('n-' + k);
+    d.querySelector('svg')?.remove(); d.querySelector('small')?.remove();
+    if (values.filter((v) => v !== null && v > 0).length >= 2) d.append(spark(values), el('small', '', caption));
+  };
+  withSpark('answered', minutes.map((m) => m.ok + m.rerouted), L.perMinLast);
+  withSpark('speed', minutes.map((m) => m.latencyMs), L.perMinLast);
+  const sp = $('n-spent'), bud = st.cost?.budgetUsd;
   sp.classList.toggle('bad', !!st.cost?.capped);
-  let meter = sp.querySelector('.meter');
-  if (b && !meter) { meter = el('div', 'meter', el('i')); sp.append(meter, el('small', 'budget')); }
-  if (!b && meter) { meter.remove(); sp.querySelector('.budget').remove(); }
-  if (b) sp.querySelector('.budget').textContent = L.of(usd(b));
-  if (b) { meter.firstChild.style.width = Math.min(100, st.cost.usd / b * 100) + '%'; meter.classList.toggle('full', !!st.cost.capped); }
-  chart(tl, st.now);
+  sp.querySelector('.meter')?.remove(); sp.querySelector('small')?.remove();
+  if (bud) {
+    const meter = el('div', 'meter' + (st.cost.capped ? ' full' : ''), el('i'));
+    meter.firstChild.style.width = Math.min(100, st.cost.usd / bud * 100) + '%';
+    sp.append(meter, el('small', '', L.of(usd(bud))));
+  }
+
+  chart(minutes);
+  journal(st);
 
   const rows = Object.entries(st.targets).sort(([a], [b]) => a.localeCompare(b));
-  $('details').hidden = !rows.length;
+  $('models-none').hidden = rows.length > 0; $('models-table').hidden = !rows.length;
   $('thead').replaceChildren(el('tr', '', el('th', '', L.model), el('th', '', L.state), el('th', 'num', L.ok), el('th', 'num', L.err),
     el('th', 'num', L.latency), el('th', 'num', L.cost), el('th', 'num', L.limit), el('th', '', L.cannot)));
   $('tbody').replaceChildren(...rows.map(([hid, t]) => {
-    const s = stateOf(t), base = hid.replace(/^[a-z]+:/, '').replace(/#[0-9]+$/, '');
-    const closed = st.cost?.capped && st.cost.priced.includes(base);
-    return el('tr', '', el('td', '', hid), el('td', '', say(closed ? 'wait' : s, t, closed)), el('td', 'num', fmt(t.ok)), el('td', 'num', fmt(t.err)),
-      el('td', 'num', t.ok ? t.latencyMs + ' ms' : '–'), el('td', 'num', st.cost?.byTarget[base] ? usd(st.cost.byTarget[base]) : '–'), el('td', 'num', t.learnedRpm ? t.learnedRpm + L.perMin : ''),
-      el('td', '', (st.cannot[base] || []).map((c) => L[c] || c).join(', ')));
+    const base = baseOf(hid), closed = st.cost?.capped && st.cost.priced.includes(base), s = closed ? 'wait' : stateOf(t);
+    const scope = hid.match(/^([a-z]+):/)?.[1], k = Number(hid.match(/#([0-9]+)$/)?.[1] || 0);
+    const id = el('td', 'id', base, el('small', '', [scope, L.key + ' ' + (k + 1)].filter(Boolean).join(' · ')));
+    return el('tr', '', id, el('td', '', el('span', 'pill ' + s, say(s, t, closed))), el('td', 'num', fmt(t.ok)), el('td', 'num' + (t.err ? '' : ' muted'), fmt(t.err)),
+      el('td', 'num', t.ok ? fmt(t.latencyMs) + ' ms' : el('span', 'muted', '–')), el('td', 'num', st.cost?.byTarget[base] ? usd(st.cost.byTarget[base]) : el('span', 'muted', '–')),
+      el('td', 'num', t.learnedRpm ? t.learnedRpm + L.perMin : el('span', 'muted', '–')),
+      el('td', '', (st.cannot[base] || []).map((c) => L[c] || c).join(', ') || el('span', 'muted', '–')));
   }));
+  $('foot').replaceChildren(...L.footer(st.version).map((x) => el('span', '', x)));
 }
 
 const SERIES = [['ok', 'sOk'], ['rerouted', 'sRerouted'], ['failed', 'sFailed']];
-$('traffic-title').textContent = L.trafficTitle; $('traffic-lead').textContent = L.trafficLead;
 $('keys').replaceChildren(...SERIES.map(([k, l]) => el('li', 'k-' + k, el('i'), L[l])));
-$('x0').textContent = L.ago(60); $('x1').textContent = L.ago(30); $('x2').textContent = L.nowLabel;
 const niceMax = (v) => { if (v <= 4) return 4; const p = 10 ** Math.floor(Math.log10(v)), m = v / p; return (m <= 2 ? 2 : m <= 5 ? 5 : 10) * p; };
-const hhmm = (t) => new Date(t).toLocaleTimeString(lang, { hour: '2-digit', minute: '2-digit' });
-let minutes = [];
-function chart(tl, now) {
+function series(tl, now) {
   const last = Math.floor(now / 60000), byMin = new Map(tl.map((b) => [Math.floor(b.t / 60000), b]));
-  minutes = Array.from({ length: 60 }, (_, i) => byMin.get(last - 59 + i) || { t: (last - 59 + i) * 60000, ok: 0, rerouted: 0, failed: 0, latencyMs: null });
-  const max = niceMax(Math.max(...minutes.map((b) => b.ok + b.rerouted + b.failed)));
+  return Array.from({ length: 60 }, (_, i) => byMin.get(last - 59 + i) || { t: (last - 59 + i) * 60000, ok: 0, rerouted: 0, failed: 0, latencyMs: null });
+}
+let minutes = [], tipAt = -1;
+function chart(m) {
+  minutes = m;
+  const max = niceMax(Math.max(...m.map((b) => b.ok + b.rerouted + b.failed)));
   $('gmax').style.top = '0'; $('gmax').firstChild.textContent = fmt(max);
   $('gmid').style.top = '50%'; $('gmid').firstChild.textContent = (max / 2).toLocaleString(lang, { maximumFractionDigits: 1 });
   const bars = $('bars');
-  if (bars.children.length !== 60) bars.replaceChildren(...minutes.map((_, i) => { const b = el('div', 'bar'); b.tabIndex = i === 59 ? 0 : -1; b.dataset.i = i; return b; }));
-  minutes.forEach((m, i) => {
+  if (bars.children.length !== 60) bars.replaceChildren(...m.map((_, i) => { const b = el('div', 'col'); b.tabIndex = i === 59 ? 0 : -1; b.dataset.i = i; return b; }));
+  m.forEach((b, i) => {
     const col = bars.children[i];
-    col.setAttribute('aria-label', hhmm(m.t) + ': ' + SERIES.map(([k, l]) => L[l] + ' ' + m[k]).join(', '));
-    col.replaceChildren(...SERIES.filter(([k]) => m[k]).map(([k]) => { const seg = el('i', k); seg.style.height = (m[k] / max * 100) + '%'; return seg; }));
+    col.setAttribute('aria-label', clock(b.t) + ': ' + SERIES.map(([k, l]) => L[l] + ' ' + b[k]).join(', '));
+    col.replaceChildren(...SERIES.filter(([k]) => b[k]).map(([k]) => { const seg = el('i', k); seg.style.height = (b[k] / max * 100) + '%'; return seg; }));
   });
   if (!$('tip').hidden && tipAt >= 0) tip(tipAt);
 }
-let tipAt = -1;
 function tip(i) {
   const m = minutes[i], col = $('bars').children[i], box = $('tip');
   if (!m || !col) return;
   tipAt = i;
-  box.replaceChildren(el('b', '', hhmm(m.t)), ...SERIES.map(([k, l]) => { const r = el('div', '', el('i', ''), L[l] + (lang === 'fr' ? ' : ' : ': ') + m[k]); r.firstChild.style.background = 'var(--s-' + k + ')'; return r; }),
+  box.replaceChildren(el('b', '', clock(m.t)), ...SERIES.map(([k, l]) => { const r = el('div', '', el('i', ''), L[l] + (lang === 'fr' ? ' : ' : ': ') + m[k]); r.firstChild.style.background = 'var(--s-' + k + ')'; return r; }),
     ...(m.latencyMs !== null ? [el('div', '', L.avgMs(fmt(m.latencyMs)))] : []));
   box.hidden = false;
   const plot = $('plot').getBoundingClientRect(), c = col.getBoundingClientRect(), half = box.offsetWidth / 2;
   box.style.left = Math.min(Math.max(c.left - plot.left + c.width / 2, half), plot.width - half) + 'px';
 }
-$('bars').addEventListener('pointerover', (e) => { const c = e.target.closest('.bar'); if (c) tip(Number(c.dataset.i)); });
+$('bars').addEventListener('pointerover', (e) => { const c = e.target.closest('.col'); if (c) tip(Number(c.dataset.i)); });
 $('bars').addEventListener('pointerleave', () => { $('tip').hidden = true; tipAt = -1; });
 $('bars').addEventListener('focusin', (e) => tip(Number(e.target.dataset.i)));
 $('bars').addEventListener('focusout', () => { $('tip').hidden = true; tipAt = -1; });
@@ -1764,7 +1921,7 @@ $('bars').addEventListener('keydown', (e) => {
   next.tabIndex = 0; next.focus();
 });
 
-function show(view) { for (const v of ['gate', 'app']) $(v).hidden = v !== view; }
+function show(view) { for (const v of ['gate', 'app']) $(v).hidden = v !== view; $('nav').hidden = view !== 'app'; }
 async function poll() {
   clearTimeout(poll.timer);
   try {
@@ -1791,29 +1948,54 @@ poll();
 const DASHBOARD = `<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
 <title>bascule</title><style>${DASHBOARD_CSS}</style></head>
-<body><main>
-<div class="top">
-  <div class="brand"><svg viewBox="0 0 32 32" aria-hidden="true"><path d="M3 22h26" stroke="currentColor" stroke-width="4" stroke-linecap="round"/><path d="M9 22c6 0 8-12 20-12" fill="none" stroke="#2455d8" stroke-width="4" stroke-linecap="round"/><circle cx="9" cy="22" r="3.5" fill="#16874a"/></svg>bascule</div>
+<body>
+<header class="bar"><div class="wrap">
+  <a class="brand" href="#overview"><svg viewBox="0 0 32 32" aria-hidden="true"><path d="M3 22h26" stroke="currentColor" stroke-width="4" stroke-linecap="round"/><path d="M9 22c6 0 8-12 20-12" fill="none" stroke="#2455d8" stroke-width="4" stroke-linecap="round"/><circle cx="9" cy="22" r="3.5" fill="#15803d"/></svg>bascule</a>
+  <nav id="nav" hidden><a href="#overview"></a><a href="#lines-title"></a><a href="#models-title"></a><a href="#connect"></a></nav>
   <div class="meta" id="meta" aria-live="polite"></div>
-</div>
-<section id="gate" class="gate" hidden>
+</div></header>
+<main class="wrap">
+<section id="gate" class="card gate" hidden>
   <h1 id="gate-title"></h1><p id="gate-text"></p>
   <form id="keyform"><input id="keyinput" type="password" autocomplete="off" aria-labelledby="gate-text"><button id="open" type="submit"></button><p id="keymsg" class="msg" role="alert"></p></form>
 </section>
 <div id="app" hidden>
-  <section class="hero" aria-live="polite"><span id="signal" class="signal" aria-hidden="true"></span><h1 id="title"></h1><p id="text"></p></section>
-  <div class="numbers" id="numbers"></div>
-  <section class="traffic" aria-labelledby="traffic-title">
-    <header><div><h2 id="traffic-title"></h2><p id="traffic-lead"></p></div><ul class="keys" id="keys"></ul></header>
-    <div class="plot" id="plot"><div class="grid-y" id="gmax"><span></span></div><div class="grid-y" id="gmid"><span></span></div><div class="bars" id="bars"></div><div class="tip" id="tip" hidden></div></div>
-    <div class="axis-x"><span id="x0"></span><span id="x1"></span><span id="x2"></span></div>
+  <section id="overview" class="card status" aria-live="polite"><span id="signal" class="signal" aria-hidden="true"></span><h1 id="title"></h1><p id="text"></p><span id="since" class="since"></span></section>
+  <div class="card kpis" id="kpis"></div>
+  <div class="grid2">
+    <section class="card traffic" aria-labelledby="traffic-title">
+      <div class="card-head"><div><h2 id="traffic-title"></h2><p id="traffic-lead"></p></div><ul class="keys" id="keys"></ul></div>
+      <div class="body">
+        <div class="plot" id="plot"><div class="grid-y" id="gmax"><span></span></div><div class="grid-y" id="gmid"><span></span></div><div class="bars" id="bars"></div><div class="tip" id="tip" hidden></div></div>
+        <div class="axis-x"><span id="x0"></span><span id="x1"></span><span id="x2"></span></div>
+      </div>
+    </section>
+    <section class="card journal" aria-labelledby="journal-title">
+      <div class="card-head"><div><h2 id="journal-title"></h2><p id="journal-lead"></p></div></div>
+      <ol id="journal"></ol>
+    </section>
+  </div>
+  <h2 class="section" id="lines-title"></h2><p class="section" id="lines-lead"></p>
+  <ul class="legend" id="legend"></ul>
+  <div class="lines" id="lines"></div>
+  <h2 class="section" id="models-title"></h2><p class="section" id="models-lead"></p>
+  <section class="card"><p class="muted" id="models-none" hidden></p>
+    <div class="tablewrap" id="models-table"><table><thead id="thead"></thead><tbody id="tbody"></tbody></table></div></section>
+  <section class="card connect" id="connect" aria-labelledby="connect-title">
+    <div class="card-head"><div><h2 id="connect-title"></h2><p id="connect-lead"></p></div></div>
+    <div class="body">
+      <dl class="fields">
+        <div><dt id="f-base"></dt><dd><span class="val" id="f-base-val"></span><button class="btn" id="copy-base" type="button" data-copy></button></dd></div>
+        <div><dt id="f-key"></dt><dd><span class="val" id="f-key-val"></span></dd></div>
+        <div><dt id="f-model"></dt><dd><span class="val" id="f-model-val"></span></dd></div>
+      </dl>
+      <div class="snippet"><div class="tabs" id="tabs" role="tablist"><button class="btn" id="copy-code" type="button" data-copy></button></div><pre id="code" role="tabpanel"></pre></div>
+    </div>
   </section>
-  <div class="section-head"><div><h2 id="lines-title"></h2><p class="lead" id="lines-lead"></p></div><ul class="legend" id="legend"></ul></div>
-  <div id="lines"></div>
-  <section class="connect"><div><h3 id="connect-title"></h3><p id="connect-text"></p></div><button id="copy" type="button"></button></section>
-  <details id="details"><summary id="details-title"></summary><div class="tablewrap"><table><thead id="thead"></thead><tbody id="tbody"></tbody></table></div></details>
 </div>
-</main><script>${DASHBOARD_JS}</script></body></html>`;
+</main>
+<footer><div class="wrap" id="foot"></div></footer>
+<script>${DASHBOARD_JS}</script></body></html>`;
 const sha = (s) => `'sha256-${createHash('sha256').update(s).digest('base64')}'`;
 const DASHBOARD_CSP = `default-src 'none'; style-src ${sha(DASHBOARD_CSS)}; script-src ${sha(DASHBOARD_JS)}; connect-src 'self'; `
   + `form-action 'none'; base-uri 'none'; frame-ancestors 'none'`;
