@@ -697,6 +697,10 @@ function loadState() {
     if (st.spend?.day === today() && Number.isFinite(st.spend.usd)) spend = { day: st.spend.day, usd: st.spend.usd, byTarget: st.spend.byTarget || {} };
   } catch {} // no state yet, or unreadable: start fresh
 }
+// Written shortly after each request as well: on Windows a stop signal kills the process at once,
+// with no chance to save on the way out.
+let saveTimer;
+const saveSoon = () => { if (!saveTimer) saveTimer = setTimeout(() => { saveTimer = null; saveState(); }, 500); };
 function saveState() {
   const cannot = Object.fromEntries([...lacks].filter(([, c]) => c.size).map(([id, c]) => [id, [...c]]));
   const rpm = Object.fromEntries([...health].filter(([, s]) => s.learnedRpm).map(([hid, s]) => [hid, s.learnedRpm]));
@@ -847,7 +851,7 @@ async function route(res, body, { endpoint, requested, cacheable }) {
     const line = Object.hasOwn(cfg.lines || {}, requested) ? cfg.lines[requested] : cfg.lines?.[aliasFor(requested)];
     const own = line && !Array.isArray(line) ? line.hedgeMs : undefined;
     const hedgeMs = Number(own ?? cfg.hedgeMs) || 0;
-    const out = await attempt(res, body, { endpoint, requested, targets, ck, t0, hedgeMs });
+    const out = await attempt(res, body, { endpoint, requested, targets, ck, t0, hedgeMs }).finally(saveSoon);
     share?.(out);
   } catch (e) { share?.(null); throw e; }
 }

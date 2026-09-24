@@ -205,6 +205,14 @@ const msg = (content = 'hi') => [{ role: 'user', content }];
 const stats = async () => (await get('/stats')).json();
 const events = (txt) => txt.split('\n\n').filter((l) => l.startsWith('data: {')).map((l) => JSON.parse(l.slice(6)));
 
+// Waits until the router has written its state file and it holds what the check expects.
+async function saved(file, check, ms = 3000) {
+  for (const end = Date.now() + ms; Date.now() < end; await new Promise((r) => setTimeout(r, 100))) {
+    try { if (check(JSON.parse(readFileSync(file, 'utf8')))) return; } catch {}
+  }
+  throw new Error(`${file} not saved in time`);
+}
+
 let passed = 0;
 const failures = [];
 async function test(name, fn) {
@@ -882,6 +890,7 @@ try {
       body: JSON.stringify({ model: 'v', messages: [{ role: 'user', content: [img] }] }) });
     let c = await start();
     await (await ask()).text();
+    await saved(join(home, 'state.json'), (st) => st.cannot?.['t/m']);
     c.kill('SIGTERM'); await new Promise((ok) => c.on('exit', ok));
     assert.deepEqual(JSON.parse(readFileSync(join(home, 'state.json'), 'utf8')).cannot, { 't/m': ['vision'] });
     const before = hits.textOnly;
@@ -922,6 +931,7 @@ try {
       const refused = await ask('paidOnly');
       assert.equal(refused.status, 402);
       assert.match((await refused.json()).error.message, /daily budget/);
+      await saved(join(home, 'state.json'), (st) => st.spend?.usd === 6);
     } finally { c.kill('SIGTERM'); await new Promise((ok) => c.on('exit', ok)); }
     c = await start();
     try { assert.equal((await cost()).usd, 6, 'spend of the day survives a restart'); }
