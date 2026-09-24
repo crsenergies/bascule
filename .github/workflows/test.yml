@@ -13,3 +13,4 @@ jobs:
         with:
           node-version: ${{ matrix.node }}
       - run: node test.mjs
+      - run: node secrets-check.mjs

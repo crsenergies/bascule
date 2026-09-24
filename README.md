@@ -119,6 +119,16 @@ Une seule adresse locale, compatible OpenAI, devant tous tes fournisseurs d'IA. 
 
 Utilise seulement des comptes et des clés auxquels tu as droit : pas de comptes gratuits multiples, pas d'abonnement grand public utilisé comme clé API.
 
+## Contributing
+
+`node secrets-check.mjs` (or `npm run check`) refuses to let an API key leave your machine: it scans every tracked file and the npm package for the values in your `.env` and for anything shaped like a provider key. It runs before `npm publish` and in CI. To run it before each commit and push too:
+
+```bash
+printf '#!/bin/sh\nexec node secrets-check.mjs --staged\n' > .git/hooks/pre-commit
+printf '#!/bin/sh\nexec node secrets-check.mjs\n' > .git/hooks/pre-push
+chmod +x .git/hooks/pre-commit .git/hooks/pre-push
+```
+
 ## Similar projects
 
 Bascule is a small, independent project, written from scratch. If you need more, look at [LiteLLM](https://github.com/BerriAI/litellm) (Python proxy with teams, budgets and 100+ providers), [OmniRoute](https://github.com/diegosouzapw/OmniRoute) (full gateway with a web app, which can also use subscription accounts) or [OpenRouter](https://openrouter.ai) (hosted service, one key for many models). Bascule stays a single file with no dependencies, uses only API keys, free tiers and local models, and runs on your machine.

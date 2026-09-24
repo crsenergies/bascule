@@ -8,7 +8,9 @@
   },
   "scripts": {
     "start": "node server.mjs",
-    "test": "node test.mjs"
+    "test": "node test.mjs",
+    "check": "node secrets-check.mjs",
+    "prepublishOnly": "node secrets-check.mjs && node test.mjs"
   },
   "engines": {
     "node": ">=20"
