@@ -3,6 +3,14 @@
   "version": "1.0.0",
   "description": "Zero-dependency OpenAI-compatible AI router: automatic fallback across providers, key rotation, cooldowns, streaming, Anthropic translation, cache.",
   "author": "Constantin Serrier",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/crsenergies/bascule.git"
+  },
+  "homepage": "https://github.com/crsenergies/bascule#readme",
+  "bugs": {
+    "url": "https://github.com/crsenergies/bascule/issues"
+  },
   "type": "module",
   "bin": {
     "bascule": "server.mjs"
