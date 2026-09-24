@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+// Copyright (c) 2026 Constantin Serrier. MIT licence (see LICENSE).
 // Refuses to let a key leave this machine: run before every commit, push and npm publish.
 // Scans what would be shared (tracked or staged files, and the npm package) for the values in the
 // local .env and for anything shaped like a provider key.

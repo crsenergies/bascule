@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 // Bascule — lean OpenAI-compatible AI router. Zero dependencies, Node >= 20.
+// Copyright (c) 2026 Constantin Serrier. MIT licence: this notice must stay in every copy (see LICENSE).
 import http from 'node:http';
 import https from 'node:https';
 import zlib from 'node:zlib';
@@ -12,13 +13,14 @@ import { spawn } from 'node:child_process';
 
 const ROOT = dirname(fileURLToPath(import.meta.url));
 const HOME_DIR = process.env.BASCULE_HOME || join(homedir(), '.bascule');
-const VERSION = JSON.parse(readFileSync(join(ROOT, 'package.json'), 'utf8')).version;
+const PKG = JSON.parse(readFileSync(join(ROOT, 'package.json'), 'utf8'));
+const VERSION = PKG.version, AUTHOR = PKG.author || 'Constantin Serrier';
 
 // ---------- cli ----------
 const arg = process.argv[2];
 if (arg === '--version' || arg === '-v') { console.log(VERSION); process.exit(0); }
 if (arg === '--help' || arg === '-h') {
-  console.log(`bascule ${VERSION} — OpenAI-compatible AI router with automatic fallback
+  console.log(`bascule ${VERSION} — OpenAI-compatible AI router with automatic fallback, by ${AUTHOR}
 
   bascule init      create ~/.bascule/config.json and ~/.bascule/.env (random access key)
   bascule           start the router (default http://127.0.0.1:8484/v1)
@@ -1085,7 +1087,7 @@ function status() {
   const cannot = Object.fromEntries([...lacks].filter(([, c]) => c.size).map(([id, c]) => [id, [...c]]));
   const lines = Object.fromEntries(Object.entries(cfg.lines || {}).map(([name, c]) =>
     [name, (Array.isArray(c) ? c : c.targets || []).map((t) => parseTarget(t)?.id).filter(Boolean)]));
-  return { version: VERSION, uptimeS: Math.round(process.uptime()), providers: Object.keys(providers), cannot,
+  return { version: VERSION, author: AUTHOR, uptimeS: Math.round(process.uptime()), providers: Object.keys(providers), cannot,
     cacheSize: cache.size, ...stats, lines, served, targets, now: now, events,
     cost: { day: spend.day, usd: spend.usd, byTarget: spend.byTarget, budgetUsd: dailyBudget() || null, capped: capped(),
       priced: [...new Set(Object.values(cfg.lines || {}).flatMap((c) => Array.isArray(c) ? c : c.targets || []).map(parseTarget).filter((t) => t && priceOf(t)).map((t) => t.id))] },
@@ -1614,7 +1616,7 @@ const T = {
     connectTitle: 'Connect an application', connectLead: 'Bascule speaks the OpenAI and Anthropic APIs. Point any compatible client at it.',
     baseUrl: 'Base URL', apiKey: 'API key', apiKeyVal: 'Your BASCULE_KEY (in ~/.bascule/.env)', modelName: 'Model', modelVal: 'auto, fast, smart or local',
     copy: 'Copy', copied: 'Copied',
-    footer: (v) => ['bascule ' + v, 'OpenAI-compatible AI router', 'MIT licence'],
+    footer: (v) => ['bascule ' + v, 'by ${AUTHOR}', 'OpenAI-compatible AI router', 'MIT licence'],
     gateTitle: 'This dashboard is locked.', gateText: 'Enter your access key: the BASCULE_KEY line in ~/.bascule/.env. The command bascule dashboard opens it already unlocked.',
     open: 'Unlock', badKey: 'This key does not match BASCULE_KEY.', placeholder: 'Access key' },
   fr: {
@@ -1646,7 +1648,7 @@ const T = {
     connectTitle: 'Brancher une application', connectLead: 'Bascule parle les API OpenAI et Anthropic. Tout client compatible peut s’y connecter.',
     baseUrl: 'URL de base', apiKey: 'Clé API', apiKeyVal: 'Votre BASCULE_KEY (dans ~/.bascule/.env)', modelName: 'Modèle', modelVal: 'auto, fast, smart ou local',
     copy: 'Copier', copied: 'Copié',
-    footer: (v) => ['bascule ' + v, 'Routeur IA compatible OpenAI', 'Licence MIT'],
+    footer: (v) => ['bascule ' + v, 'par ${AUTHOR}', 'Routeur IA compatible OpenAI', 'Licence MIT'],
     gateTitle: 'Ce tableau de bord est verrouillé.', gateText: 'Saisissez votre clé d’accès : la ligne BASCULE_KEY du fichier ~/.bascule/.env. La commande bascule dashboard l’ouvre directement déverrouillé.',
     open: 'Déverrouiller', badKey: 'Cette clé ne correspond pas à BASCULE_KEY.', placeholder: 'Clé d’accès' },
 };

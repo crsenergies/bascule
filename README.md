@@ -1,5 +1,7 @@
 # bascule
 
+By **Constantin Serrier**. MIT licence.
+
 *Bascule* is French for "switch over": when a provider fails, your request switches to the next one.
 
 One local OpenAI-compatible endpoint in front of all your AI providers. When one fails or hits its rate limit, the request moves to the next one, down to a local Ollama model if you want. Single file, zero dependencies, under 50 MB of RAM at rest.
@@ -135,4 +137,4 @@ Bascule is a small, independent project, written from scratch. If you need more,
 
 ## License
 
-MIT
+MIT, © 2026 Constantin Serrier. You may use, change and share Bascule freely, as long as the copyright notice and the licence text stay in every copy.

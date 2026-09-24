@@ -1,3 +1,4 @@
+// Copyright (c) 2026 Constantin Serrier. MIT licence (see LICENSE).
 // End-to-end tests against mock providers: no network, no keys. Run: node test.mjs
 import http from 'node:http';
 import { spawn, spawnSync } from 'node:child_process';
