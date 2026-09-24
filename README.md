@@ -15,24 +15,24 @@ npm install -g bascule   # or clone the repo and run: node server.mjs
 bascule init             # creates ~/.bascule/config.json and ~/.bascule/.env
 # put your API keys in ~/.bascule/.env (empty = provider disabled)
 bascule doctor           # checks every key and model; --deep sends one tiny request per model
-bascule                  # http://127.0.0.1:20129/v1
+bascule                  # http://127.0.0.1:8484/v1
 ```
 
-Free models come and go every few weeks. `bascule discover` checks each provider's catalogue: models in your config that are no longer offered, new chat models you could use, and, where the catalogue has prices (OpenRouter), the ones that cost nothing. `bascule discover --apply` removes the retired models and adds up to 3 free ones per provider to the `auto` combo, before the local fallback. Before adding a model it sends it one tiny request, so only models that really answer get in. The previous config is kept as `config.json.bak`. Stealth models (free because they keep your prompts for training) are never picked.
+Free models come and go every few weeks. `bascule discover` checks each provider's catalogue: models in your config that are no longer offered, new chat models you could use, and, where the catalogue has prices (OpenRouter), the ones that cost nothing. `bascule discover --apply` removes the retired models and adds up to 3 free ones per provider to the `auto` line, before the local fallback. Before adding a model it sends it one tiny request, so only models that really answer get in. The previous config is kept as `config.json.bak`. Stealth models (free because they keep your prompts for training) are never picked.
 
 While it runs, `bascule status` shows live counters: requests, fallbacks, tokens, and the state of every target (ready, cooling, learned rate limit).
 
-The same view lives in your browser: `bascule dashboard` opens http://127.0.0.1:20129/, which refreshes every 2 seconds and shows each combo as a chain of targets, green when ready, orange while pausing, red when failing. The page is built into `server.mjs` (no extra files, nothing loaded from the internet) and reads the stats with your `BASCULE_KEY`.
+The same view lives in your browser: `bascule dashboard` opens http://127.0.0.1:8484/, which refreshes every 2 seconds and shows each line as a chain of targets, green when ready, orange while pausing, red when failing. The page is built into `server.mjs` (no extra files, nothing loaded from the internet) and reads the stats with your `BASCULE_KEY`.
 
 Point any OpenAI client at it:
 
 ```python
 from openai import OpenAI
-client = OpenAI(base_url="http://127.0.0.1:20129/v1", api_key="<BASCULE_KEY>")
+client = OpenAI(base_url="http://127.0.0.1:8484/v1", api_key="<BASCULE_KEY>")
 client.chat.completions.create(model="auto", messages=[{"role": "user", "content": "Hello"}])
 ```
 
-`model` is a combo (`auto`, `fast`, `smart`, `local`), `provider/model` (`groq/openai/gpt-oss-120b`), or a bare model name. Leaving it out uses `defaultModel`.
+`model` is a line name (`auto`, `fast`, `smart`, `local`), `provider/model` (`groq/openai/gpt-oss-120b`), or a bare model name. Leaving it out uses `defaultModel`.
 
 ## Features
 
@@ -45,13 +45,13 @@ client.chat.completions.create(model="auto", messages=[{"role": "user", "content
 - Size limits: a "request too large" answer (Groq's per-minute token cap, context limits) is learned per target. Larger requests skip that target from then on, smaller ones keep using it, and the target is not put on cooldown.
 - Per-minute budgets: set `rpm` on a provider, or let bascule learn it from a 429 that states the quota (Gemini does). A target at its budget is skipped without calling it, so no quota is burnt on requests that could only fail.
 - Identical concurrent `temperature: 0` requests share a single upstream call.
-- Speed: upstream connections are kept alive and warmed up at start, which saves the 100-200 ms TLS handshake Node's `fetch` pays after 4 s of idle (measured: 170-190 ms less per request on Groq and Gemini). Combos can hedge: with `hedgeMs`, if the first target has not answered in time, the next one starts in parallel and the first answer wins (on by default for `auto`, 3 s, and `fast`, 1 s). bascule itself adds about 0.3 ms per request.
-- Anthropic Messages API (`POST /v1/messages`, `/v1/messages/count_tokens`): Claude Code and the Anthropic SDKs work with any provider. Set `ANTHROPIC_BASE_URL=http://127.0.0.1:20129`. `aliases` map names such as `claude-*` onto combos.
+- Speed: upstream connections are kept alive and warmed up at start, which saves the 100-200 ms TLS handshake Node's `fetch` pays after 4 s of idle (measured: 170-190 ms less per request on Groq and Gemini). Lines can hedge: with `hedgeMs`, if the first target has not answered in time, the next one starts in parallel and the first answer wins (on by default for `auto`, 3 s, and `fast`, 1 s). bascule itself adds about 0.3 ms per request.
+- Anthropic Messages API (`POST /v1/messages`, `/v1/messages/count_tokens`): Claude Code and the Anthropic SDKs work with any provider. Set `ANTHROPIC_BASE_URL=http://127.0.0.1:8484`. `aliases` map names such as `claude-*` onto lines.
 - Empty answers, in-stream errors after a content-free first chunk, and tool calls rejected by the provider (Groq's `tool_use_failed`) all fall back to the next target.
 - Per-provider `minMaxTokens` stops reasoning models from spending a small `max_tokens` on thinking and returning nothing; `params` adds provider-specific fields without overriding the client's.
 - Capability learning: when a model rejects images or tools, the request moves to the next model, and bascule remembers the gap so later image or tool requests skip that model while text requests still use it. What it learns (capability gaps, per-minute quotas) is kept in `~/.bascule/state.json` across restarts.
 - Text-only content arrays are sent as plain strings, for APIs such as Groq that accept nothing else.
-- Combo strategies: `priority` (default), `fastest` (measured latency), `round-robin`.
+- Line strategies: `priority` (default), `fastest` (measured latency), `round-robin`.
 - OpenAI ⇄ Anthropic translation: system prompt, images, tools, tool results, streaming.
 - Response cache for `temperature: 0` requests (LRU, 10 min by default).
 - Client disconnect cancels the upstream request, so you are not billed for answers nobody reads.
@@ -67,7 +67,7 @@ Lookup order, first found wins:
 | 3 | `~/.bascule/config.json` | `~/.bascule/.env` |
 | 4 | bundled `config.json` | bundled `.env` |
 
-`config.json` lists `providers` (`type`: `openai` or `anthropic`, `baseUrl`, `keys`, `models`, optional `headers`, `rpm`, and `streamUsage: false` for APIs that reject `stream_options`) and `combos`. Top-level tuning: `timeoutMs`, `firstByteTimeoutMs`, `idleTimeoutMs`, `maxWaitMs`, `cache`, `corsOrigins`, `log`. `${VAR}` is replaced by the environment variable. Any OpenAI-compatible service works: add it with its base URL.
+`config.json` lists `providers` (`type`: `openai` or `anthropic`, `baseUrl`, `keys`, `models`, optional `headers`, `rpm`, and `streamUsage: false` for APIs that reject `stream_options`) and `lines`: each line is a model name your apps can ask for (`auto`, `fast`...) and the ordered list of `provider/model` targets behind it, like the stations of a metro line. Top-level tuning: `timeoutMs`, `firstByteTimeoutMs`, `idleTimeoutMs`, `maxWaitMs`, `cache`, `corsOrigins`, `log`. `${VAR}` is replaced by the environment variable. Any OpenAI-compatible service works: add it with its base URL.
 
 Edits to the config or the `.env` file are applied live, without restart (also on `SIGHUP`). An edit that does not parse is rejected and the previous config keeps running. Only the address and port need a restart.
 
@@ -114,10 +114,14 @@ Une seule adresse locale, compatible OpenAI, devant tous tes fournisseurs d'IA. 
 1. Installer Node.js 20+, puis `npm install -g bascule`.
 2. `bascule init`, puis mettre tes clés API dans `~/.bascule/.env`.
 3. `bascule doctor` pour vérifier que tes clés marchent.
-   Pour Claude Code : `ANTHROPIC_BASE_URL=http://127.0.0.1:20129 claude`.
-4. `bascule`, puis régler tes outils sur `http://127.0.0.1:20129/v1` avec le modèle `auto`. `bascule status` montre ce qui se passe, et `bascule dashboard` ouvre la même vue dans le navigateur, en direct. `bascule discover` repère les modèles retirés et les nouveaux modèles gratuits ; `bascule discover --apply` met la config à jour (après avoir vérifié que chaque modèle ajouté répond vraiment). Pour suivre vos dépenses, indiquez les prix des modèles payants (`prices`, en dollars par million de tokens) et un plafond (`budget.dailyUsd`) : une fois le plafond du jour atteint, seuls les modèles gratuits sont utilisés jusqu'à minuit.
+   Pour Claude Code : `ANTHROPIC_BASE_URL=http://127.0.0.1:8484 claude`.
+4. `bascule`, puis régler tes outils sur `http://127.0.0.1:8484/v1` avec le modèle `auto`. `bascule status` montre ce qui se passe, et `bascule dashboard` ouvre la même vue dans le navigateur, en direct. `bascule discover` repère les modèles retirés et les nouveaux modèles gratuits ; `bascule discover --apply` met la config à jour (après avoir vérifié que chaque modèle ajouté répond vraiment). Pour suivre vos dépenses, indiquez les prix des modèles payants (`prices`, en dollars par million de tokens) et un plafond (`budget.dailyUsd`) : une fois le plafond du jour atteint, seuls les modèles gratuits sont utilisés jusqu'à minuit.
 
 Utilise seulement des comptes et des clés auxquels tu as droit : pas de comptes gratuits multiples, pas d'abonnement grand public utilisé comme clé API.
+
+## Similar projects
+
+Bascule is a small, independent project, written from scratch. If you need more, look at [LiteLLM](https://github.com/BerriAI/litellm) (Python proxy with teams, budgets and 100+ providers), [OmniRoute](https://github.com/diegosouzapw/OmniRoute) (full gateway with a web app, which can also use subscription accounts) or [OpenRouter](https://openrouter.ai) (hosted service, one key for many models). Bascule stays a single file with no dependencies, uses only API keys, free tiers and local models, and runs on your machine.
 
 ## License
 

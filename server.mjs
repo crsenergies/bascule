@@ -21,7 +21,7 @@ if (arg === '--help' || arg === '-h') {
   console.log(`bascule ${VERSION} — OpenAI-compatible AI router with automatic fallback
 
   bascule init      create ~/.bascule/config.json and ~/.bascule/.env (random access key)
-  bascule           start the router (default http://127.0.0.1:20129/v1)
+  bascule           start the router (default http://127.0.0.1:8484/v1)
   bascule doctor    check every configured key and model (add --deep to send a tiny real request)
   bascule status    show live stats of the running router
   bascule discover  find retired models and new free ones (add --apply to update the config)
@@ -89,7 +89,7 @@ try { cfg = readConfig(); }
 catch (e) { console.error(`cannot read config ${CONFIG_PATH}: ${e.message}`); process.exit(1); }
 
 // Address is fixed for the process lifetime; everything below can change on reload.
-const PORT = Number(process.env.BASCULE_PORT || cfg.port || 20129);
+const PORT = Number(process.env.BASCULE_PORT || cfg.port || 8484);
 const HOST = process.env.BASCULE_HOST || cfg.host || '127.0.0.1';
 let API_KEY, CORS, TIMEOUT, FIRST_BYTE_TIMEOUT, IDLE_TIMEOUT, CACHE_MAX, CACHE_TTL, LOG, MAX_WAIT;
 function applySettings() {
@@ -183,14 +183,14 @@ const latency = (t) => Math.min(...t.provider.keys.map((_, k) => h(`${t.id}#${k}
 
 // Resolve requested model into ordered list of { provider, model, id }.
 function resolve(model) {
-  const combo = Object.hasOwn(cfg.combos || {}, model) ? cfg.combos[model] : null;
-  if (!combo) { const t = parseTarget(model); return t ? [t] : []; }
-  const targets = Array.isArray(combo) ? combo : combo.targets || [];
-  const strategy = Array.isArray(combo) ? 'priority' : combo.strategy || 'priority';
+  const line = Object.hasOwn(cfg.lines || {}, model) ? cfg.lines[model] : null;
+  if (!line) { const t = parseTarget(model); return t ? [t] : []; }
+  const targets = Array.isArray(line) ? line : line.targets || [];
+  const strategy = Array.isArray(line) ? 'priority' : line.strategy || 'priority';
   let list = targets.map(parseTarget).filter(Boolean);
   if (strategy === 'fastest') list.sort((a, b) => latency(a) - latency(b));
   else if (strategy === 'round-robin' && list.length) {
-    const n = (combo._rr = ((combo._rr ?? -1) + 1) % list.length);
+    const n = (line._rr = ((line._rr ?? -1) + 1) % list.length);
     list = [...list.slice(n), ...list.slice(0, n)];
   }
   return list;
@@ -513,7 +513,7 @@ async function* toAnthropicStream(gen, model) {
     usage: { input_tokens: usage?.prompt_tokens || 0, output_tokens: usage?.completion_tokens || 0 } }) + ev('message_stop', {});
 }
 
-// Claude Code asks for claude-* models by name. Aliases map such names onto combos or targets.
+// Claude Code asks for claude-* models by name. Aliases map such names onto lines or targets.
 function aliasFor(model) {
   for (const [pattern, target] of Object.entries(cfg.aliases || {})) {
     const re = new RegExp('^' + pattern.split('*').map((x) => x.replace(/[.+?^${}()|[\]\\]/g, '\\$&')).join('.*') + '$');
@@ -745,7 +745,7 @@ function cacheSet(k, v) {
 
 // ---------- stats ----------
 const stats = { requests: 0, answered: 0, rerouted: 0, cacheHits: 0, fallbacks: 0, hedges: 0, failures: 0, tokens: { prompt: 0, completion: 0 } };
-// Answers per combo and target: the dashboard animates each new one along its line.
+// Answers per line and target: the dashboard animates each new one along its line.
 const served = {};
 // Per-minute activity for the last hour, for the dashboard chart.
 const timeline = [];
@@ -814,7 +814,7 @@ function overBudget(t, k) {
   return true;
 }
 
-// Tries each (target, key) pair until one answers, healthy pairs first in combo order.
+// Tries each (target, key) pair until one answers, healthy pairs first in line order.
 // When every target is only rate limited or overloaded and one frees up within maxWaitMs,
 // the request waits for it instead of failing.
 async function route(res, body, { endpoint, requested, cacheable }) {
@@ -842,8 +842,8 @@ async function route(res, body, { endpoint, requested, cacheable }) {
     share = (out) => { inflight.delete(ck); resolveShare(out); };
   }
   try {
-    const combo = Object.hasOwn(cfg.combos || {}, requested) ? cfg.combos[requested] : cfg.combos?.[aliasFor(requested)];
-    const own = combo && !Array.isArray(combo) ? combo.hedgeMs : undefined;
+    const line = Object.hasOwn(cfg.lines || {}, requested) ? cfg.lines[requested] : cfg.lines?.[aliasFor(requested)];
+    const own = line && !Array.isArray(line) ? line.hedgeMs : undefined;
     const hedgeMs = Number(own ?? cfg.hedgeMs) || 0;
     const out = await attempt(res, body, { endpoint, requested, targets, ck, t0, hedgeMs });
     share?.(out);
@@ -977,7 +977,7 @@ async function attempt(res, body, { endpoint, requested, targets: allTargets, ck
         }
         success(k.hid, Date.now() - up.t0);
         tally(tries > 1 ? 'rerouted' : 'ok', Date.now() - t0);
-        if (Object.hasOwn(cfg.combos || {}, requested)) (served[requested] ??= {})[t.id] = (served[requested][t.id] || 0) + 1;
+        if (Object.hasOwn(cfg.lines || {}, requested)) (served[requested] ??= {})[t.id] = (served[requested][t.id] || 0) + 1;
         log(200, requested, t.id, t0, tries - 1);
         return out;
       } catch (e) {
@@ -1071,7 +1071,7 @@ async function pipeStream(up, t, res, head, model) {
 
 function listModels() {
   const data = [];
-  for (const name of Object.keys(cfg.combos || {})) data.push({ id: name, object: 'model', owned_by: 'bascule' });
+  for (const name of Object.keys(cfg.lines || {})) data.push({ id: name, object: 'model', owned_by: 'bascule' });
   for (const p of Object.values(providers)) for (const m of p.models) data.push({ id: `${p.name}/${m}`, object: 'model', owned_by: p.name });
   return { object: 'list', data };
 }
@@ -1083,12 +1083,12 @@ function status() {
     coolingForS: s.until > now ? Math.ceil((s.until - now) / 1000) : 0, ...(s.learnedRpm && { learnedRpm: s.learnedRpm }),
     ...(s.maxTokens && { maxTokens: s.maxTokens }) };
   const cannot = Object.fromEntries([...lacks].filter(([, c]) => c.size).map(([id, c]) => [id, [...c]]));
-  const combos = Object.fromEntries(Object.entries(cfg.combos || {}).map(([name, c]) =>
+  const lines = Object.fromEntries(Object.entries(cfg.lines || {}).map(([name, c]) =>
     [name, (Array.isArray(c) ? c : c.targets || []).map((t) => parseTarget(t)?.id).filter(Boolean)]));
   return { version: VERSION, uptimeS: Math.round(process.uptime()), providers: Object.keys(providers), cannot,
-    cacheSize: cache.size, ...stats, combos, served, targets, now: now, events,
+    cacheSize: cache.size, ...stats, lines, served, targets, now: now, events,
     cost: { day: spend.day, usd: spend.usd, byTarget: spend.byTarget, budgetUsd: dailyBudget() || null, capped: capped(),
-      priced: [...new Set(Object.values(cfg.combos || {}).flatMap((c) => Array.isArray(c) ? c : c.targets || []).map(parseTarget).filter((t) => t && priceOf(t)).map((t) => t.id))] },
+      priced: [...new Set(Object.values(cfg.lines || {}).flatMap((c) => Array.isArray(c) ? c : c.targets || []).map(parseTarget).filter((t) => t && priceOf(t)).map((t) => t.id))] },
     timeline: timeline.filter((b) => b.m > now / 60_000 - 60).map((b) => ({ t: b.m * 60_000, ok: b.ok, rerouted: b.rerouted, failed: b.failed,
       latencyMs: b.n ? Math.round(b.ms / b.n) : null })) };
 }
@@ -1173,10 +1173,10 @@ async function doctor(deep) {
       }
     }
   }
-  for (const [name, combo] of Object.entries(cfg.combos || {})) {
-    const targets = Array.isArray(combo) ? combo : combo.targets || [];
+  for (const [name, line] of Object.entries(cfg.lines || {})) {
+    const targets = Array.isArray(line) ? line : line.targets || [];
     const active = targets.filter((t) => parseTarget(t));
-    console.log(`  combo ${name}: ${active.length}/${targets.length} targets active${active.length ? '' : '  <- unusable, add a key'}`);
+    console.log(`  line ${name}: ${active.length}/${targets.length} targets active${active.length ? '' : '  <- unusable, add a key'}`);
   }
   if (!deep) console.log('\n  (listing only: run "bascule doctor --deep" to send one tiny request per model)');
   return working;
@@ -1273,7 +1273,7 @@ async function discover(apply) {
   if (!retiredCount && !toAdd.length) { console.log('\n  nothing to change automatically'); return true; }
   if (!apply) {
     console.log(`\n  run "bascule discover --apply" to remove ${retiredCount} retired model${retiredCount === 1 ? '' : 's'}`
-      + `${toAdd.length ? ` and add ${toAdd.map(([n, f]) => `${f.free.length} free ${n} model${f.free.length === 1 ? '' : 's'}`).join(', ')} to the "auto" combo` : ''}`);
+      + `${toAdd.length ? ` and add ${toAdd.map(([n, f]) => `${f.free.length} free ${n} model${f.free.length === 1 ? '' : 's'}`).join(', ')} to the "auto" line` : ''}`);
     return true;
   }
   // Edit the file as written, with its ${VARIABLES} intact, not the expanded config in memory.
@@ -1283,11 +1283,11 @@ async function discover(apply) {
   for (const [n, f] of Object.entries(found)) {
     file.providers[n].models = (file.providers[n].models || []).filter((m) => !f.retired.includes(m));
   }
-  for (const [name, c] of Object.entries(file.combos || {})) {
+  for (const [name, c] of Object.entries(file.lines || {})) {
     const keep = (list) => list.filter((t) => !drop.has(t));
-    if (Array.isArray(c)) file.combos[name] = keep(c); else c.targets = keep(c.targets || []);
+    if (Array.isArray(c)) file.lines[name] = keep(c); else c.targets = keep(c.targets || []);
   }
-  const auto = file.combos?.auto;
+  const auto = file.lines?.auto;
   const autoList = Array.isArray(auto) ? auto : auto?.targets;
   for (const [n, f] of toAdd) {
     for (const m of f.free) {
@@ -1354,7 +1354,7 @@ if (arg === 'dashboard') {
 
 // ---------- dashboard ----------
 // One self-contained page, no external assets. The strict CSP pins the inline style and script by hash.
-// Each combo is drawn as a transit line: a request leaves the first station and stops at the first
+// Each line is drawn as a transit line: a request leaves the first station and stops at the first
 // open one. Every answer seen since the last refresh runs along its line as a small train.
 const DASHBOARD_CSS = `
 :root { color-scheme: light dark;
@@ -1604,7 +1604,7 @@ const T = {
     evLearned: (t, c) => '<code>' + t + '</code> cannot handle ' + c + ': such requests now skip it', evReload: 'Configuration reloaded',
     evReloadFailed: (m) => 'New configuration rejected, previous one kept: ' + m, evBudget: (b) => 'Daily budget of ' + b + ' reached: free models only until midnight',
     why: { 429: 'rate limit', 401: 'key refused', 403: 'key refused', 402: 'no credit left', 0: 'unreachable', 5: 'provider error' },
-    linesTitle: 'Lines', linesLead: 'Each combo is a line. A request stops at the first open station; if that one is paused or down, it continues to the next.',
+    linesTitle: 'Lines', linesLead: 'Each line is a model name your apps can ask for. A request stops at the first open station; if that one is paused or down, it continues to the next.',
     now: 'Now serving', blockedLine: 'No open station', served: (n) => n + ' answered',
     go: 'Open', ready: 'Available', wait: (s) => 'Back in ' + s, stopped: 'Down', idle: 'Not used yet',
     lgo: 'Open', lwait: 'Paused, reopens on its own', lstopped: 'Down, check the key', lidle: 'Not used yet',
@@ -1636,7 +1636,7 @@ const T = {
     evLearned: (t, c) => '<code>' + t + '</code> ne gère pas les ' + c + ' : ces demandes l’évitent désormais', evReload: 'Configuration rechargée',
     evReloadFailed: (m) => 'Nouvelle configuration refusée, l’ancienne reste active : ' + m, evBudget: (b) => 'Budget du jour de ' + b + ' atteint : modèles gratuits uniquement jusqu’à minuit',
     why: { 429: 'limite atteinte', 401: 'clé refusée', 403: 'clé refusée', 402: 'crédit épuisé', 0: 'injoignable', 5: 'erreur du fournisseur' },
-    linesTitle: 'Lignes', linesLead: 'Chaque combo est une ligne. Une demande s’arrête à la première station ouverte ; si elle est en pause ou en panne, la demande continue vers la suivante.',
+    linesTitle: 'Lignes', linesLead: 'Chaque ligne est un nom de modèle que vos applications peuvent demander. Une demande s’arrête à la première station ouverte ; si elle est en pause ou en panne, la demande continue vers la suivante.',
     now: 'Dessert', blockedLine: 'Aucune station ouverte', served: (n) => n + (n === '1' ? ' servie' : ' servies'),
     go: 'Ouverte', ready: 'Disponible', wait: (s) => 'Retour dans ' + s, stopped: 'En panne', idle: 'Pas encore utilisée',
     lgo: 'Ouverte', lwait: 'En pause, rouvre d’elle-même', lstopped: 'En panne, vérifier la clé', lidle: 'Pas encore utilisée',
@@ -1760,7 +1760,7 @@ function spark(values) {
 let shape = '', built = {}, lastServed = null;
 function buildLines(st) {
   built = {};
-  $('lines').replaceChildren(...Object.entries(st.combos || {}).map(([name, ids], i) => {
+  $('lines').replaceChildren(...Object.entries(st.lines || {}).map(([name, ids], i) => {
     const info = el('span', 'info'), cnt = el('span', 'count');
     const stops = ids.map((id) => {
       const [who, what] = split(id), how = el('span', 'how');
@@ -1816,7 +1816,7 @@ const svgEl = (tag, attrs = {}, ...kids) => { const e = document.createElementNS
 let net = null, lastOk = null;
 function providersOf(st) {
   const seen = [];
-  for (const ids of Object.values(st.combos || {})) for (const id of ids) { const p = split(id)[0]; if (!seen.includes(p)) seen.push(p); }
+  for (const ids of Object.values(st.lines || {})) for (const id of ids) { const p = split(id)[0]; if (!seen.includes(p)) seen.push(p); }
   for (const hid of Object.keys(st.targets)) { const p = split(baseOf(hid))[0]; if (!seen.includes(p)) seen.push(p); }
   return seen.slice(0, 8);
 }
@@ -1899,7 +1899,7 @@ addEventListener('resize', () => { clearTimeout(resizeTimer); resizeTimer = setT
 
 function render(st) {
   $('meta').replaceChildren(el('span', 'pulse'), L.live, el('span', 'extra', '· ' + L.updated + clock(Date.now(), true)));
-  const sig = JSON.stringify(st.combos || {});
+  const sig = JSON.stringify(st.lines || {});
   if (sig !== shape) { shape = sig; buildLines(st); }
 
   let paused = new Set(), blocked = [];

@@ -180,7 +180,7 @@ writeFileSync(join(dir, 'config.json'), JSON.stringify({
     an: P(anthropic, { type: 'anthropic', keys: ['ak'], models: ['claude'] }), anCrlf: P(anthropicCrlf, { type: 'anthropic' }), anErr: P(anthropicErr, { type: 'anthropic' }),
     off: { baseUrl: 'http://127.0.0.1:1', keys: ['${UNSET_VAR}'], models: ['x'] },
   },
-  combos: {
+  lines: {
     auto: ['limited/m', 'echo/m'], smart: ['echo/m'], quick: ['fast/m'], dated: ['limitedDate/m', 'echo/m'], keys: ['badKey/m'], keys400: ['badKey400/m'], dead: ['broken/m', 'echo/m'], unpaid: ['unpaid/m', 'echo/m'],
     badreq: ['badReq/m', 'echo/m'], toolong: ['tooLong/m', 'echo/m'], toobig: ['tooBig/m', 'echo/m'],
     serr: ['streamErr/m', 'echo/m'], sempty: ['streamEmpty/m', 'echo/m'], named: ['namedErr/m', 'echo/m'], blank: ['blank/m', 'echo/m'], late: ['lateErr/m', 'echo/m'], toolfail: ['toolFail/m', 'echo/m'], scut: ['streamCut/m', 'echo/m'], sstall: ['streamStall/m'],
@@ -235,9 +235,9 @@ try {
     assert.ok(csp.includes(hash(html.match(/<script>([\s\S]*)<\/script>/)[1])), 'script hash');
     assert.ok(csp.includes(hash(html.match(/<style>([\s\S]*)<\/style>/)[1])), 'style hash');
   });
-  await test('stats list each combo with its resolved targets', async () => {
+  await test('stats list each line with its resolved targets', async () => {
     const st = await stats();
-    assert.deepEqual(st.combos.hedge, ['tortoise/m', 'fast/m']);
+    assert.deepEqual(st.lines.hedge, ['tortoise/m', 'fast/m']);
   });
   await test('stats keep a per-minute timeline of outcomes', async () => {
     const sum = (st) => st.timeline.reduce((a, b) => a + b.ok + b.rerouted + b.failed, 0);
@@ -248,19 +248,19 @@ try {
     assert.ok(st.timeline.length <= 60);
     assert.ok(Number.isFinite(st.timeline.at(-1).latencyMs));
   });
-  await test('stats count answers per combo and target', async () => {
+  await test('stats count answers per line and target', async () => {
     const total = (st) => Object.values(st.served.nohedge || {}).reduce((a, b) => a + b, 0);
     const before = total(await stats());
     assert.equal((await post({ model: 'nohedge', messages: msg('served count') })).status, 200);
     const st = await stats();
     assert.equal(total(st), before + 1);
-    assert.ok(!st.served['echo/m'], 'direct model names are not combos');
+    assert.ok(!st.served['echo/m'], 'direct model names are not lines');
   });
   await test('bad JSON gives 400', async () => assert.equal((await post('{nope')).status, 400));
   await test('JSON that is not an object gives 400', async () => assert.equal((await post('[1,2]')).status, 400));
   await test('empty messages give 400', async () => assert.equal((await post({ model: 'auto', messages: [] })).status, 400));
   await test('unknown model gives 404', async () => assert.equal((await post({ model: 'nope', messages: msg() })).status, 404));
-  await test('prototype names are not combos', async () => {
+  await test('prototype names are not lines', async () => {
     for (const model of ['__proto__', 'constructor', 'toString']) assert.equal((await post({ model, messages: msg() })).status, 404);
   });
   await test('body over 32 MB gives 413', async () => {
@@ -649,7 +649,7 @@ try {
   const aTools = [{ name: 'meteo', description: 'weather', input_schema: { type: 'object', properties: { city: { type: 'string' } } } },
     { type: 'web_search_20250305', name: 'web_search' }];
   const aevents = (txt) => txt.split('\n\n').filter(Boolean).map((b) => ({ event: b.match(/^event: (.+)$/m)?.[1], data: JSON.parse(b.match(/^data: (.+)$/m)[1]) }));
-  await test('messages: system, text and alias claude-* -> smart combo', async () => {
+  await test('messages: system, text and alias claude-* -> smart line', async () => {
     const r = await amsg({ model: 'claude-sonnet-5', max_tokens: 100, system: [{ type: 'text', text: 'be brief', cache_control: { type: 'ephemeral' } }],
       messages: [{ role: 'user', content: 'hello' }] });
     const j = await r.json();
@@ -663,7 +663,7 @@ try {
     assert.equal(j.stop_reason, 'end_turn');
     assert.deepEqual(j.usage, { input_tokens: 5, output_tokens: 1 });
   });
-  await test('messages: claude-haiku-* alias goes to its own combo', async () => {
+  await test('messages: claude-haiku-* alias goes to its own line', async () => {
     const r = await amsg({ model: 'claude-haiku-4-5-20251001', max_tokens: 10, messages: [{ role: 'user', content: 'x' }] });
     assert.equal(r.headers.get('x-bascule-target'), 'fast/m');
   });
@@ -749,7 +749,7 @@ try {
     assert.ok(st.targets['embeddings:broken/m#0'] || st.targets['embeddings:broken/m#1'] || st.targets['embeddings:broken/m#2']);
     assert.ok(Object.keys(st.targets).some((id) => id.startsWith('broken/m#')), 'chat health kept separately');
   });
-  await test('models list shows combos and enabled providers only', async () => {
+  await test('models list shows lines and enabled providers only', async () => {
     const ids = (await (await get('/v1/models')).json()).data.map((m) => m.id);
     assert.ok(ids.includes('auto') && ids.includes('an/claude') && !ids.includes('off/x'));
   });
@@ -823,14 +823,14 @@ try {
     assert.match(r.stdout, /requests \d+/);
     assert.match(r.stdout, /echo\/m#0 +ok +\d+/);
   });
-  await test('doctor reports keys, listed and missing models, dead combos', async () => {
+  await test('doctor reports keys, listed and missing models, dead lines', async () => {
     const home = mkdtempSync(join(tmpdir(), 'bascule-doc-'));
     writeFileSync(join(home, 'config.json'), JSON.stringify({ providers: {
       good: { baseUrl: echo, keys: ['k'], models: ['m', 'retired'] },
       bad: { baseUrl: badKey400, keys: ['sk-or-v1-misplaced'], models: ['m'] },
       down: { baseUrl: 'http://127.0.0.1:1', keys: ['k'], models: ['m'] },
       nokey: { baseUrl: echo, keys: ['${NOPE_UNSET}'], models: ['m'] } },
-      combos: { ok: ['good/m'], dead: ['nokey/m'] } }));
+      lines: { ok: ['good/m'], dead: ['nokey/m'] } }));
     // Async spawn: spawnSync would block this process, and with it the mock providers doctor calls.
     const r = await new Promise((ok) => {
       const c = spawn(process.execPath, [SERVER, 'doctor', '--deep'], { cwd: dir, env: { ...env, BASCULE_CONFIG: join(home, 'config.json') } });
@@ -845,12 +845,12 @@ try {
     assert.match(r.stdout, /✗ +bad key 1 .*invalid key.*looks like a openrouter key: move it to the OPENROUTER_API_KEY line/);
     assert.match(r.stdout, /✗ +down key 1 .*unreachable/);
     assert.match(r.stdout, /nokey: no key set/);
-    assert.match(r.stdout, /combo dead: 0\/1 .*unusable/);
+    assert.match(r.stdout, /line dead: 0\/1 .*unusable/);
   });
   await test('config edits are reloaded live; a broken edit keeps the old config', async () => {
     const home = mkdtempSync(join(tmpdir(), 'bascule-reload-'));
     const cfgPath = join(home, 'config.json'), p4 = port + 3;
-    const write = (combos) => writeFileSync(cfgPath, JSON.stringify({ port: p4, providers: { e: { baseUrl: echo, keys: ['k'], models: ['m'] } }, combos }));
+    const write = (lines) => writeFileSync(cfgPath, JSON.stringify({ port: p4, providers: { e: { baseUrl: echo, keys: ['k'], models: ['m'] } }, lines }));
     write({ one: ['e/m'] });
     const s4 = spawn(process.execPath, [SERVER], { cwd: home, env: { ...env, BASCULE_CONFIG: cfgPath }, stdio: ['ignore', 'pipe', 'pipe'] });
     await new Promise((ok) => s4.stdout.once('data', ok));
@@ -860,7 +860,7 @@ try {
       assert.equal(await call('two'), 404);
       await sleep(1100); write({ one: ['e/m'], two: ['e/m'] });
       for (let i = 0; i < 40 && (await call('two')) !== 200; i++) await sleep(100);
-      assert.equal(await call('two'), 200, 'new combo live without restart');
+      assert.equal(await call('two'), 200, 'new line live without restart');
       await sleep(1100); writeFileSync(cfgPath, '{ broken json');
       await sleep(1800);
       assert.equal(await call('two'), 200, 'broken edit must not take the router down');
@@ -871,7 +871,7 @@ try {
     const p5 = port + 4;
     const cfgPath = join(home, 'config.json');
     writeFileSync(cfgPath, JSON.stringify({ port: p5, providers: { t: { baseUrl: textOnly, keys: ['k'], models: ['m'] }, e: { baseUrl: echo, keys: ['k'], models: ['m'] } },
-      combos: { v: ['t/m', 'e/m'] } }));
+      lines: { v: ['t/m', 'e/m'] } }));
     const start = async () => {
       const c = spawn(process.execPath, [SERVER], { cwd: home, env: { ...env, BASCULE_CONFIG: cfgPath, BASCULE_HOME: home }, stdio: ['ignore', 'pipe', 'inherit'] });
       await new Promise((ok) => c.stdout.once('data', ok));
@@ -896,7 +896,7 @@ try {
     const cfgPath = join(home, 'config.json');
     // echo answers with 5 prompt and 1 completion tokens: at $1M per million each, one answer costs $6.
     writeFileSync(cfgPath, JSON.stringify({ port: p6, providers: { paid: { baseUrl: echo, keys: ['k'], models: ['m'] }, free: { baseUrl: echo, keys: ['k'], models: ['m'] } },
-      prices: { 'paid/*': [1e6, 1e6] }, budget: { dailyUsd: 5 }, combos: { mix: ['paid/m', 'free/m'], paidOnly: ['paid/m'] } }));
+      prices: { 'paid/*': [1e6, 1e6] }, budget: { dailyUsd: 5 }, lines: { mix: ['paid/m', 'free/m'], paidOnly: ['paid/m'] } }));
     const start = async () => {
       const c = spawn(process.execPath, [SERVER], { cwd: home, env: { ...env, BASCULE_CONFIG: cfgPath, BASCULE_HOME: home }, stdio: ['ignore', 'pipe', 'inherit'] });
       await new Promise((ok) => c.stdout.once('data', ok));
@@ -932,7 +932,7 @@ try {
     writeFileSync(cfgPath, JSON.stringify({ providers: {
       cat: { baseUrl: catalog, keys: ['${CAT_KEY}'], models: ['kept', 'gone'] },
       local: { baseUrl: echo, requiresKey: false, models: ['m'] } },
-    combos: { auto: { hedgeMs: 5, targets: ['cat/kept', 'cat/gone', 'local/m'] }, other: ['cat/gone', 'local/m'] } }, null, 2));
+    lines: { auto: { hedgeMs: 5, targets: ['cat/kept', 'cat/gone', 'local/m'] }, other: ['cat/gone', 'local/m'] } }, null, 2));
     const run = (args) => new Promise((ok) => {
       const c = spawn(process.execPath, [SERVER, 'discover', ...args], { cwd: home, env: { ...env, BASCULE_CONFIG: cfgPath, CAT_KEY: 'k' } });
       let stdout = '', stderr = '';
@@ -952,8 +952,8 @@ try {
     const out = JSON.parse(readFileSync(cfgPath, 'utf8'));
     assert.deepEqual(out.providers.cat.models, ['kept', 'works:free']);
     assert.equal(out.providers.cat.keys[0], '${CAT_KEY}', 'variables stay unexpanded');
-    assert.deepEqual(out.combos.auto, { hedgeMs: 5, targets: ['cat/kept', 'cat/works:free', 'local/m'] }, 'free model goes before the local fallback');
-    assert.deepEqual(out.combos.other, ['local/m']);
+    assert.deepEqual(out.lines.auto, { hedgeMs: 5, targets: ['cat/kept', 'cat/works:free', 'local/m'] }, 'free model goes before the local fallback');
+    assert.deepEqual(out.lines.other, ['local/m']);
     assert.equal(JSON.parse(readFileSync(cfgPath + '.bak', 'utf8')).providers.cat.models.length, 2, 'backup of the previous config');
   });
   await test('answered and rerouted count requests, not attempts; client errors are neither', async () => {
